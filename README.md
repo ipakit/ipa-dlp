@@ -102,11 +102,11 @@ The default output is:
 ~/Downloads/Spotify-9.1.88.ipa
 ```
 
-Only that one file is written. Account data is stripped by default: `SC_Info`
-licenses are removed and the Apple ID/purchaser fields are scrubbed from
-`iTunesMetadata.plist`. The wrapper checks the decryption report and the output
-archive before printing `account data stripped: yes`; if either check fails, it
-deletes the output and exits with an error.
+Account data is stripped by default: `SC_Info` licenses are removed and the
+Apple ID/purchaser fields are scrubbed from `iTunesMetadata.plist`.
+The wrapper checks the decryption report and the output archive
+before printing `account data stripped: yes`; if either check fails,
+it deletes the output and exits with an error.
 
 Use `--keep-account-data` if you need the licenses for further analysis, and
 `--full` to keep the extra artifacts:
@@ -139,7 +139,7 @@ ipa-dlp setup --seed spotify --version 9.1.88
 
 ### Version selection
 
-`--version` matches the IPA's `CFBundleShortVersionString` exactly. The wrapper
+`--version` matches the IPA's `CFBundleShortVersionString`. The wrapper
 maps it to Apple's external version identifier by asking the App Store for
 metadata, newest versions first, and caches the mapping in
 `~/Library/Caches/ipa-dlp/versions/`. Very old versions can take longer to
@@ -157,7 +157,7 @@ account, so the wrapper asks for confirmation before using it on a paid app.
 ipa-dlp get some-paid-app --purchase
 ```
 
-## What happens on first run
+## On first run
 
 1. Pinned `ipatool 2.7.0` and `UnfairPlay 0.2.0` releases are downloaded and
    SHA-256 verified into `~/.local/share/ipa-dlp/bin/`.
