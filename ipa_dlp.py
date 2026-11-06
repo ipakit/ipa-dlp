@@ -464,6 +464,10 @@ def _arrow_select(prompt: str, items: List[str]) -> str:
             if ch == b"\x03":  # Ctrl-C
                 raise KeyboardInterrupt
             if ch == b"\x1b":
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if not ready:
+                    # A bare Esc is a cancel, not the start of an arrow key.
+                    raise Cancelled()
                 seq = os.read(fd, 2)
                 if seq == b"[A":  # Up
                     selected = max(0, selected - 1)
