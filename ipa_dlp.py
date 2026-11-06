@@ -2594,26 +2594,41 @@ def load_macho(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # These flags are valid before or after the subcommand. SUPPRESS keeps a
+    # subparser from overwriting a value parsed by the root parser (and vice
+    # versa); main() falls back to False when neither parser saw the flag.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--gui",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="use macOS dialogs instead of terminal prompts",
+    )
+    common.add_argument(
+        "--verbose",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="verbose command logging",
+    )
+    common.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="emit one structured JSON object on stdout",
+    )
+
     parser = argparse.ArgumentParser(
         prog=APP,
         description="Fetch and decrypt personalized App Store IPAs.",
+        parents=[common],
     )
     parser.add_argument("--version", action="version", version="%s %s" % (APP, VERSION))
-    parser.add_argument(
-        "--gui",
-        action="store_true",
-        help="use macOS dialogs instead of terminal prompts",
-    )
-    parser.add_argument("--verbose", action="store_true", help="verbose command logging")
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="emit one structured JSON object on stdout",
-    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     setup = subparsers.add_parser(
-        "setup", help="install tools and sign in to the App Store"
+        "setup",
+        help="install tools and sign in to the App Store",
+        parents=[common],
     )
     setup.add_argument("--update", action="store_true", help="reinstall pinned tools")
     setup.add_argument("--reauth", action="store_true", help="force a new login")
@@ -2627,7 +2642,9 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--platform", default=DEFAULT_PLATFORM)
     setup.set_defaults(func=cmd_setup)
 
-    get = subparsers.add_parser("get", help="download and decrypt an app")
+    get = subparsers.add_parser(
+        "get", help="download and decrypt an app", parents=[common]
+    )
     get.add_argument("query", help="app name, bundle ID, or App Store ID")
     get.add_argument("--version", help="exact app version, e.g. 9.1.88")
     get.add_argument("--external-version-id", help="skip version lookup with an App Store external version ID")
@@ -2680,7 +2697,9 @@ def build_parser() -> argparse.ArgumentParser:
     get.set_defaults(func=cmd_get)
 
     decrypt = subparsers.add_parser(
-        "decrypt", help="decrypt an IPA already downloaded to this Mac"
+        "decrypt",
+        help="decrypt an IPA already downloaded to this Mac",
+        parents=[common],
     )
     decrypt.add_argument("ipa")
     decrypt.add_argument("-o", "--output")
@@ -2713,6 +2732,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract = subparsers.add_parser(
         "extract",
         help="extract the arm64 Mach-O slice from an IPA, .app, or binary",
+        parents=[common],
     )
     extract.add_argument("target", help="path to an .ipa, .app, or Mach-O file")
     extract.add_argument(
@@ -2730,7 +2750,9 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--force", action="store_true")
     extract.set_defaults(func=cmd_extract)
 
-    status = subparsers.add_parser("status", help="show tools, account, and model state")
+    status = subparsers.add_parser(
+        "status", help="show tools, account, and model state", parents=[common]
+    )
     status.set_defaults(func=cmd_status)
 
     return parser
@@ -2743,9 +2765,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     parser = build_parser()
     args = parser.parse_args(argv)
-    USE_GUI = bool(args.gui)
-    VERBOSE = bool(args.verbose)
-    JSON_OUTPUT = bool(args.json)
+    USE_GUI = bool(getattr(args, "gui", False))
+    VERBOSE = bool(getattr(args, "verbose", False))
+    JSON_OUTPUT = bool(getattr(args, "json", False))
     if os.geteuid() == 0:
         message = (
             "run ipa-dlp as your normal user; it asks for admin only when needed"
