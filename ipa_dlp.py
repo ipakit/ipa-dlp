@@ -30,6 +30,7 @@ import sys
 import tarfile
 import tempfile
 import termios
+import threading
 import time
 import tty
 import zipfile
@@ -610,7 +611,6 @@ def install_ipatool() -> None:
         install_binary(find_binary(root, "ipatool"), ipatool_path())
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    _record_tool_version("ipatool", IPATOOL_VERSION)
     log("installed ipatool %s at %s" % (IPATOOL_VERSION, ipatool_path()), tag="ipatool")
 
 
@@ -631,36 +631,16 @@ def install_unfairplay() -> None:
                 shutil.copy2(str(item), str(license_dir / item.name))
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    _record_tool_version("unfairplay", UNFAIRPLAY_VERSION)
     log("installed UnfairPlay %s at %s" % (UNFAIRPLAY_VERSION, unfairplay_path()), tag="unfairplay")
 
 
-def _record_tool_version(name: str, version: str) -> None:
-    """Persist the installed tool version in config.json for fast startup checks."""
-    config = read_config()
-    tools = config.get("tool_versions")
-    if not isinstance(tools, dict):
-        tools = {}
-    tools[name] = version
-    config["tool_versions"] = tools
-    save_config(config)
+def _tool_ready(path: Path) -> bool:
+    """Return True when the pinned tool exists and is executable.
 
-
-def _tool_version_ok(name: str, path: Path, expected: str) -> bool:
-    """Return True if the tool at *path* is the expected version.
-
-    Checks config.json first (fast path), falls back to ``--version`` only when
-    the recorded version is missing or stale.
+    Deliberately avoids spawning ``--version`` on every run: the install path
+    is private to ipa-dlp and `setup --update` is the way to refresh it.
     """
-    if not path.exists():
-        return False
-    config = read_config()
-    recorded = (config.get("tool_versions") or {}).get(name)
-    if recorded == expected and os.access(str(path), os.X_OK):
-        return True
-    # Slow path: actually spawn the binary.
-    version = tool_version(path)
-    return expected in version
+    return path.is_file() and os.access(str(path), os.X_OK)
 
 
 def ensure_tools(update: bool = False) -> None:
@@ -674,32 +654,21 @@ def ensure_tools(update: bool = False) -> None:
     ipatool = ipatool_path()
     unfairplay = unfairplay_path()
 
-    need_ipatool = update or not ipatool.exists()
-    if not need_ipatool:
-        need_ipatool = not _tool_version_ok("ipatool", ipatool, IPATOOL_VERSION)
-    if need_ipatool:
+    if update or not _tool_ready(ipatool):
         if os.environ.get("IPADLP_IPATOOL"):
             raise CliError(
-                "IPADLP_IPATOOL points to %s, but it is missing or not %s"
-                % (ipatool, IPATOOL_VERSION)
+                "IPADLP_IPATOOL points to %s, but it is missing or not executable"
+                % ipatool
             )
         install_ipatool()
 
-    need_unfairplay = update or not unfairplay.exists()
-    if not need_unfairplay:
-        need_unfairplay = not _tool_version_ok("unfairplay", unfairplay, UNFAIRPLAY_VERSION)
-    if need_unfairplay:
+    if update or not _tool_ready(unfairplay):
         if os.environ.get("IPADLP_UNFAIRPLAY"):
             raise CliError(
-                "IPADLP_UNFAIRPLAY points to %s, but it is missing or not %s"
-                % (unfairplay, UNFAIRPLAY_VERSION)
+                "IPADLP_UNFAIRPLAY points to %s, but it is missing or not executable"
+                % unfairplay
             )
         install_unfairplay()
-
-    if not os.access(str(ipatool), os.X_OK):
-        raise CliError("ipatool is not executable: %s" % ipatool)
-    if not os.access(str(unfairplay), os.X_OK):
-        raise CliError("unfairplay is not executable: %s" % unfairplay)
 
 
 # ---------------------------------------------------------------------------
@@ -1248,12 +1217,78 @@ def app_is_free(app: Dict[str, Any]) -> bool:
         return str(value).strip() in ("0", "0.00", "Free")
 
 
+def _clear_progress_line() -> None:
+    """Erase the live progress line so streamed output can be written."""
+    if JSON_OUTPUT or not sys.stderr.isatty():
+        return
+    sys.stderr.write("\r\x1b[K")
+    sys.stderr.flush()
+
+
+def _percent_from_line(line: str) -> Optional[float]:
+    matches = re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", line)
+    if not matches:
+        return None
+    try:
+        value = float(matches[-1])
+    except ValueError:
+        return None
+    return value if 0.0 <= value <= 100.0 else None
+
+
+def _is_json_line(line: str) -> bool:
+    stripped = strip_ansi(line).strip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        json.loads(stripped)
+    except Exception:
+        return False
+    return True
+
+
+def _stream_line(line: str, tag: str, lock: "threading.Lock") -> None:
+    text = strip_ansi(line).rstrip()
+    if not text:
+        return
+    with lock:
+        _clear_progress_line()
+        log(text, tag=tag)
+
+
+def _progress_text(
+    megabytes: float,
+    speed: float,
+    elapsed: float,
+    percent: Optional[float],
+) -> str:
+    elapsed_str = "%02d:%02d" % (int(elapsed) // 60, int(elapsed) % 60)
+    if percent is not None:
+        return "%.1fMiB (%.0f%%) at %.1fMiB/s (%s)" % (
+            megabytes,
+            percent,
+            speed,
+            elapsed_str,
+        )
+    return "%.1fMiB at %.1fMiB/s (%s)" % (megabytes, speed, elapsed_str)
+
+
 def run_with_progress(
     argv: Sequence[Any],
     watch: Optional[Path],
     label: str,
     timeout: int = 1800,
+    total_bytes: Optional[int] = None,
+    tag: str = "download",
 ) -> Tuple[int, str]:
+    """Run *argv* while streaming stdout/stderr and reporting progress.
+
+    Both pipes are read line by line on reader threads, so tool output appears
+    immediately instead of only on failure. Percentage updates in the tool's
+    output (or *total_bytes*, when the caller knows it) drive a single progress
+    line with download speed and elapsed time; the line is cleared with
+    ``\\r\\x1b[K`` before any streamed line is written.
+    """
     cmd = [str(item) for item in argv]
     vlog("+ " + " ".join(cmd))
     started = time.time()
@@ -1261,56 +1296,86 @@ def run_with_progress(
     last_size = 0.0
     last_speed_time = started
     output_chunks: list[str] = []
+    lock = threading.Lock()
+    state: Dict[str, Optional[float]] = {"percent": None}
+
     try:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
             env=os.environ.copy(),
         )
-        assert process.stdout is not None
-        while True:
-            if time.time() - started > timeout:
-                process.kill()
-                raise CliError("%s timed out" % label)
-            ready, _, _ = select.select([process.stdout], [], [], 0.1)
-            if ready:
-                chunk = process.stdout.read1(8192)  # type: ignore[attr-defined]
-                if chunk:
-                    output_chunks.append(chunk.decode("utf-8", "replace"))
+    except FileNotFoundError as exc:
+        raise CliError("missing command: %s" % cmd[0]) from exc
+    assert process.stdout is not None and process.stderr is not None
+
+    def reader(stream: Any, stream_tag: str) -> None:
+        try:
+            for raw in stream:
+                line = raw.rstrip("\n")
+                with lock:
+                    output_chunks.append(line + "\n")
+                percent = _percent_from_line(line)
+                if percent is not None:
+                    state["percent"] = percent
+                    continue
+                if _is_json_line(line):
+                    # ipatool's machine-readable result line is parsed later.
+                    continue
+                _stream_line(line, stream_tag, lock)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threads = [
+        threading.Thread(target=reader, args=(process.stdout, tag), daemon=True),
+        threading.Thread(target=reader, args=(process.stderr, tag), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    try:
+        while process.poll() is None:
             now = time.time()
+            if now - started > timeout:
+                raise CliError("%s timed out" % label)
             interval = 0.5 if sys.stderr.isatty() else 15
             if now - last_report >= interval:
                 last_report = now
                 elapsed = now - started
                 if watch is not None and watch.exists():
-                    megabytes = watch.stat().st_size / (1024 * 1024)
+                    size = watch.stat().st_size
+                    megabytes = size / (1024 * 1024)
                     dt = now - last_speed_time
                     speed = (megabytes - last_size) / dt if dt > 0 else 0.0
                     last_size = megabytes
                     last_speed_time = now
-                    elapsed_str = "%02d:%02d" % (int(elapsed) // 60, int(elapsed) % 60)
+                    percent = state["percent"]
+                    if total_bytes:
+                        percent = 100.0 * size / total_bytes
                     _progress_line(
-                        "%.1fMiB at %.1fMiB/s (%s)" % (megabytes, speed, elapsed_str),
-                        tag="download",
+                        _progress_text(megabytes, speed, elapsed, percent),
+                        tag=tag,
                     )
                 else:
-                    _progress_line(
-                        "%.0fs" % elapsed,
-                        tag="download",
-                    )
-            if process.poll() is not None:
-                # Drain remaining output after process exits.
-                remaining = process.stdout.read()
-                if remaining:
-                    output_chunks.append(remaining.decode("utf-8", "replace"))
-                break
-        _finish_progress()
-        output = "".join(output_chunks)
-        return process.returncode, output
+                    _progress_line("%.0fs" % elapsed, tag=tag)
+            time.sleep(0.05)
+        process.wait()
     except Exception:
-        _finish_progress()
+        process.kill()
+        process.wait()
         raise
+    finally:
+        for thread in threads:
+            thread.join(timeout=5)
+        _finish_progress()
+
+    return process.returncode, "".join(output_chunks)
 
 
 def download_ipa(
@@ -1437,6 +1502,12 @@ FAT_HEADER_SIZE = 8
 FAT_ENTRY_SIZE = 20
 FAT_ENTRY_SIZE_64 = 32
 
+# Load commands that carry the FairPlay cryptid.
+LC_ENCRYPTION_INFO = 0x21
+LC_ENCRYPTION_INFO_64 = 0x2C
+MH_HEADER_SIZE = 28
+MH_HEADER_SIZE_64 = 32
+
 
 def _uint(blob: bytes, offset: int, width: int, big_endian: bool) -> int:
     return int.from_bytes(
@@ -1510,6 +1581,50 @@ def read_ipa_executable(ipa: Path, info: Dict[str, Any]) -> bytes:
             raise CliError("IPA has no executable at %s" % member) from exc
     offset, size = macho_slice(blob)
     return blob[offset : offset + size]
+
+
+def is_macho_encrypted(slice_data: bytes) -> bool:
+    """Return True when a Mach-O slice still carries a FairPlay cryptid.
+
+    Walks the load commands of a thin image looking for
+    ``LC_ENCRYPTION_INFO_64`` (and the 32-bit ``LC_ENCRYPTION_INFO``) and
+    reports whether ``cryptid`` is non-zero. A slice without an encryption
+    command is treated as decrypted.
+    """
+    magic = slice_data[:4]
+    if magic in (MH_MAGIC, MH_MAGIC_64):
+        big_endian = False
+    elif magic in (MH_CIGAM, MH_CIGAM_64):
+        big_endian = True
+    else:
+        raise CliError(
+            "not a Mach-O image (magic %s)" % magic.hex()
+        )
+    header_size = (
+        MH_HEADER_SIZE_64
+        if magic in (MH_MAGIC_64, MH_CIGAM_64)
+        else MH_HEADER_SIZE
+    )
+    if len(slice_data) < header_size:
+        raise CliError("truncated Mach-O header")
+    count = _uint(slice_data, 16, 4, big_endian)
+    command_bytes = _uint(slice_data, 20, 4, big_endian)
+    offset = header_size
+    end = min(len(slice_data), header_size + command_bytes)
+    for _ in range(count):
+        if offset + 8 > end:
+            raise CliError("truncated Mach-O load commands")
+        command = _uint(slice_data, offset, 4, big_endian)
+        command_size = _uint(slice_data, offset + 4, 4, big_endian)
+        if command_size < 8 or offset + command_size > end:
+            raise CliError("invalid Mach-O load command size")
+        if command in (LC_ENCRYPTION_INFO, LC_ENCRYPTION_INFO_64):
+            if command_size < 20:
+                raise CliError("truncated Mach-O encryption command")
+            cryptid = _uint(slice_data, offset + 16, 4, big_endian)
+            return cryptid != 0
+        offset += command_size
+    return False
 
 
 def extract_macho_binary(ipa: Path, info: Dict[str, Any], dest: Path) -> Path:
