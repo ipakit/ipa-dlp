@@ -893,12 +893,17 @@ def itunes_lookup(
     item = results[0]
     if not isinstance(item, dict) or not item.get("trackId"):
         return None
+    try:
+        size = int(item.get("fileSizeBytes") or 0)
+    except (TypeError, ValueError):
+        size = 0
     return {
         "id": str(item.get("trackId")),
         "bundleID": str(item.get("bundleId") or ""),
         "name": str(item.get("trackName") or item.get("bundleId") or "App"),
         "platforms": [platform_name],
         "price": item.get("price"),
+        "size": size,
     }
 
 
@@ -1345,21 +1350,67 @@ def _stream_line(line: str, tag: str, lock: "threading.Lock") -> None:
         log(text, tag=tag)
 
 
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total >= 3600:
+        return "%d:%02d:%02d" % (
+            total // 3600,
+            (total % 3600) // 60,
+            total % 60,
+        )
+    return "%02d:%02d" % (total // 60, total % 60)
+
+
 def _progress_text(
     megabytes: float,
     speed: float,
     elapsed: float,
     percent: Optional[float],
+    total_megabytes: Optional[float] = None,
 ) -> str:
-    elapsed_str = "%02d:%02d" % (int(elapsed) // 60, int(elapsed) % 60)
     if percent is not None:
-        return "%.1fMiB (%.0f%%) at %.1fMiB/s (%s)" % (
-            megabytes,
+        percent = max(0.0, min(100.0, percent))
+        width = 24
+        filled = max(0, min(width, int(width * percent / 100.0)))
+        bar = "█" * filled + "░" * (width - filled)
+        if total_megabytes:
+            if speed > 0:
+                eta = _format_duration(
+                    max(0.0, total_megabytes - megabytes) / speed
+                )
+            else:
+                eta = "--:--"
+            return "[%s] %5.1f%% of %.1fMiB at %.1fMiB/s ETA %s" % (
+                bar,
+                percent,
+                total_megabytes,
+                speed,
+                eta,
+            )
+        return "[%s] %5.1f%% at %.1fMiB/s (%s)" % (
+            bar,
             percent,
             speed,
-            elapsed_str,
+            _format_duration(elapsed),
         )
-    return "%.1fMiB at %.1fMiB/s (%s)" % (megabytes, speed, elapsed_str)
+    return "%.1fMiB at %.1fMiB/s (%s)" % (
+        megabytes,
+        speed,
+        _format_duration(elapsed),
+    )
+
+
+def _watch_size(watch: Optional[Path]) -> Optional[int]:
+    """Return the current download size, falling back to ipatool's .tmp file."""
+    if watch is None:
+        return None
+    for candidate in (watch, watch.with_name(watch.name + ".tmp")):
+        try:
+            if candidate.exists():
+                return candidate.stat().st_size
+        except OSError:
+            continue
+    return None
 
 
 def run_with_progress(
@@ -1373,9 +1424,10 @@ def run_with_progress(
     """Run *argv* while streaming stdout/stderr and reporting progress.
 
     Both pipes are read line by line on reader threads, so tool output appears
-    immediately instead of only on failure. Percentage updates in the tool's
-    output (or *total_bytes*, when the caller knows it) drive a single progress
-    line with download speed and elapsed time; the line is cleared with
+    immediately instead of only on failure. The output file (or ipatool's
+    ``.tmp`` streaming file) is watched for live bytes; a known *total_bytes*
+    or a percentage in the tool's output drives a single progress line with a
+    bar, percentage, speed, and ETA. The line is cleared with
     ``\\r\\x1b[K`` before any streamed line is written.
     """
     cmd = [str(item) for item in argv]
@@ -1387,6 +1439,7 @@ def run_with_progress(
     output_chunks: list[str] = []
     lock = threading.Lock()
     state: Dict[str, Optional[float]] = {"percent": None}
+    total_megabytes = total_bytes / (1024 * 1024) if total_bytes else None
 
     try:
         process = subprocess.Popen(
@@ -1437,8 +1490,8 @@ def run_with_progress(
             if now - last_report >= interval:
                 last_report = now
                 elapsed = now - started
-                if watch is not None and watch.exists():
-                    size = watch.stat().st_size
+                size = _watch_size(watch)
+                if size is not None:
                     megabytes = size / (1024 * 1024)
                     dt = now - last_speed_time
                     speed = (megabytes - last_size) / dt if dt > 0 else 0.0
@@ -1448,7 +1501,13 @@ def run_with_progress(
                     if total_bytes:
                         percent = 100.0 * size / total_bytes
                     _progress_line(
-                        _progress_text(megabytes, speed, elapsed, percent),
+                        _progress_text(
+                            megabytes,
+                            speed,
+                            elapsed,
+                            percent,
+                            total_megabytes,
+                        ),
                         tag=tag,
                     )
                 else:
@@ -1475,6 +1534,24 @@ def download_ipa(
     purchase: bool = False,
 ) -> Dict[str, Any]:
     app_id = str(app.get("id", ""))
+    total_bytes = 0
+    try:
+        total_bytes = int(app.get("size") or 0)
+    except (TypeError, ValueError):
+        total_bytes = 0
+    if not total_bytes and app_id:
+        # Search results from ipatool do not carry a size; the public lookup
+        # does, and it is what makes the bar and ETA possible. For a pinned
+        # older version this is the current version's size, so the bar is an
+        # estimate, but still far more useful than no ETA.
+        looked_up = itunes_lookup({"id": app_id}, platform_name)
+        if looked_up:
+            try:
+                total_bytes = int(looked_up.get("size") or 0)
+            except (TypeError, ValueError):
+                total_bytes = 0
+            if total_bytes:
+                app["size"] = total_bytes
     cmd: List[Any] = [
         ipatool_path(),
         "download",
@@ -1492,7 +1569,11 @@ def download_ipa(
         cmd.extend(["--platform", platform_name])
 
     code, output = run_with_progress(
-        cmd, destination, "downloading IPA", timeout=1800
+        cmd,
+        destination,
+        "downloading IPA",
+        timeout=1800,
+        total_bytes=total_bytes or None,
     )
     parsed = parse_json(output)
     if code != 0 or (parsed and parsed.get("success") is False):
