@@ -145,10 +145,31 @@ Universal ("fat") executables are reduced to the arm64 slice (falling back to
 x86_64), written with mode `0755`, and the `.bin` path is what gets printed on
 stdout. The IPA is still written; pass `--force` to replace an existing `.bin`.
 
+### Extracting from an existing IPA, .app, or binary
+
+`ipa-dlp extract` works on files you already have and does not need an App
+Store account:
+
+```sh
+ipa-dlp extract ~/Downloads/Spotify-9.1.88.ipa        # -> Spotify-9.1.88.bin
+ipa-dlp extract ~/Applications/MyApp.app -o MyApp.bin
+ipa-dlp extract ./SomeBinary -o SomeBinary.arm64
+```
+
+For an IPA it reads `CFBundleExecutable`, checks the Mach-O encryption command,
+and extracts directly when the payload is already decrypted. If `cryptid` is
+non-zero, the command requires `SC_Info`, decrypts through UnfairPlay into a
+temporary directory (the usual model/admin rules apply), and extracts from
+that copy. A `.app` or raw Mach-O that is still encrypted cannot be decrypted
+in place; it is extracted with a warning. `-o` templates and `--exec` work as
+described below.
+
+`extract` accepts `--json` like the other commands.
+
 ### Output templates and hooks
 
-`-o` and `--exec` accept tokens expanded from the downloaded app's
-`Info.plist`:
+`-o` on `get`, `decrypt`, and `extract`, plus `--exec` on all three, accept
+tokens expanded from the app's `Info.plist`:
 
 | Token | Value |
 | --- | --- |
@@ -172,8 +193,9 @@ artifact path — the `.bin` when `--extract-binary` is set, otherwise the
 `%`-formatting, so write `%%` for a literal `%`. A failing hook exits non-zero
 after the artifacts are kept.
 
-`ipa-dlp decrypt` supports `-o` templates and `--exec` too; `%(external_id)s`
-is empty there because the input's version ID is not resolved.
+For `extract`, tokens are read from an IPA or `.app`; a raw Mach-O only has
+`%(name)s` (its filename stem). `%(external_id)s` is empty for `decrypt` and
+`extract` because the input's version ID is not resolved.
 
 ### JSON output
 
@@ -214,6 +236,7 @@ Other commands:
 ```sh
 ipa-dlp status
 ipa-dlp decrypt /path/to/App.ipa
+ipa-dlp extract /path/to/App.ipa
 ipa-dlp setup --update          # reinstall pinned ipatool/UnfairPlay
 ipa-dlp setup --reauth          # force a new Apple ID login
 ipa-dlp setup --seed spotify    # create the model now instead of on first get

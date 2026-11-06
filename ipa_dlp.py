@@ -1416,6 +1416,34 @@ def download_ipa(
     return read_ipa_info(destination)
 
 
+def _plist_info(
+    plist: Dict[str, Any],
+    path: Path,
+    root: str,
+) -> Dict[str, Any]:
+    """Build the shared info dict from a parsed app Info.plist."""
+    executable = str(plist.get("CFBundleExecutable") or "")
+    if not executable:
+        raise CliError("app Info.plist has no CFBundleExecutable")
+    name = (
+        plist.get("CFBundleDisplayName")
+        or plist.get("CFBundleName")
+        or plist.get("CFBundleIdentifier")
+        or "App"
+    )
+    return {
+        "path": str(path),
+        "root": root,
+        "bundle_id": str(plist.get("CFBundleIdentifier") or ""),
+        "name": str(name),
+        "version": str(plist.get("CFBundleShortVersionString") or ""),
+        "build": str(plist.get("CFBundleVersion") or ""),
+        "executable": executable,
+        "minimum_os": str(plist.get("MinimumOSVersion") or ""),
+        "sinf": None,
+    }
+
+
 def read_ipa_info(ipa: Path) -> Dict[str, Any]:
     try:
         archive = zipfile.ZipFile(str(ipa))
@@ -1434,35 +1462,39 @@ def read_ipa_info(ipa: Path) -> Dict[str, Any]:
             )
         info_member = infos[0]
         root = info_member[: -len("/Info.plist")]
-        data = archive.read(info_member)
         try:
-            info = plistlib.loads(data)
+            plist = plistlib.loads(archive.read(info_member))
         except Exception as exc:
             raise CliError("could not parse app Info.plist") from exc
-        executable = str(info.get("CFBundleExecutable") or "")
-        if not executable:
-            raise CliError("app Info.plist has no CFBundleExecutable")
-        sinf = "%s/SC_Info/%s.sinf" % (root, executable)
+        if not isinstance(plist, dict):
+            raise CliError("app Info.plist is not a dictionary")
+        info = _plist_info(plist, ipa, root)
+        sinf = "%s/SC_Info/%s.sinf" % (root, info["executable"])
         # A decrypted/stripped IPA legitimately has no license; callers that
         # need one (extraction of an encrypted binary) check this field.
-        sinf_member = sinf if sinf in names else None
-        name = (
-            info.get("CFBundleDisplayName")
-            or info.get("CFBundleName")
-            or info.get("CFBundleIdentifier")
-            or "App"
-        )
-        return {
-            "path": str(ipa),
-            "root": root,
-            "bundle_id": str(info.get("CFBundleIdentifier") or ""),
-            "name": str(name),
-            "version": str(info.get("CFBundleShortVersionString") or ""),
-            "build": str(info.get("CFBundleVersion") or ""),
-            "executable": executable,
-            "minimum_os": str(info.get("MinimumOSVersion") or ""),
-            "sinf": sinf_member,
-        }
+        info["sinf"] = sinf if sinf in names else None
+        return info
+
+
+def read_app_info(app_dir: Path) -> Dict[str, Any]:
+    """Read the same info dict from an unpacked .app bundle."""
+    app_dir = app_dir.expanduser()
+    plist_path = app_dir / "Info.plist"
+    if not plist_path.is_file():
+        raise CliError("app bundle has no Info.plist: %s" % app_dir)
+    try:
+        plist = plistlib.loads(plist_path.read_bytes())
+    except Exception as exc:
+        raise CliError("could not parse app Info.plist") from exc
+    if not isinstance(plist, dict):
+        raise CliError("app Info.plist is not a dictionary")
+    info = _plist_info(plist, app_dir, str(app_dir))
+    executable = app_dir / info["executable"]
+    if not executable.is_file():
+        raise CliError("app bundle has no executable at %s" % executable)
+    sinf = app_dir / "SC_Info" / (info["executable"] + ".sinf")
+    info["sinf"] = str(sinf) if sinf.is_file() else None
+    return info
 
 
 def extract_app(ipa: Path) -> Tuple[Path, Path]:
@@ -2285,6 +2317,20 @@ def cmd_decrypt(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_extract(args: argparse.Namespace) -> int:
+    result = _extract_local(
+        Path(args.target),
+        args.output,
+        force=args.force,
+        exec_hook=args.exec_cmd or "",
+    )
+    if JSON_OUTPUT:
+        _emit_json(result)
+    else:
+        print(result["artifact"])
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     ensure_tools()
     info = auth_info()
@@ -2401,37 +2447,113 @@ def _slice_blob(blob: bytes) -> bytes:
 
 
 def _default_extract_output(target: Path) -> Path:
-    if target.suffix.lower() == ".ipa" or (
-        target.is_file() and zipfile.is_zipfile(str(target))
-    ):
-        return binary_path(target)
-    return target.parent / (target.stem + ".bin")
-
-
-def _local_macho_bytes(target: Path) -> bytes:
     if target.is_dir():
-        raise CliError(".app bundles are not supported yet")
-    if target.is_file() and zipfile.is_zipfile(str(target)):
-        return read_ipa_executable(target, read_ipa_info(target))
-    return _slice_blob(target.read_bytes())
+        return target.parent / (target.stem + ".bin")
+    if target.suffix.lower() == ".ipa" or zipfile.is_zipfile(str(target)):
+        return binary_path(target)
+    dest = target.parent / (target.stem + ".bin")
+    if dest == target:
+        dest = target.parent / (target.name + ".bin")
+    return dest
+
+
+def _decrypt_for_extract(ipa: Path, info: Dict[str, Any]) -> bytes:
+    """Decrypt *ipa* into a temp directory and return its arm64 slice."""
+    ensure_tools()
+    work = Path(tempfile.mkdtemp(prefix="ipa-dlp-extract-"))
+    try:
+        decrypted = work / "App.ipa"
+        decrypt_ipa(ipa, info, decrypted, keep_account_data=False, force=True)
+        data = read_ipa_executable(decrypted, info)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if is_macho_encrypted(data):
+        raise CliError("decrypted IPA still reports FairPlay encryption")
+    return data
+
+
+def _target_info(target: Path) -> Dict[str, Any]:
+    """Read app metadata for an IPA, .app bundle, or raw Mach-O."""
+    if target.is_dir():
+        if target.suffix.lower() != ".app":
+            raise CliError("input is not an .app bundle: %s" % target)
+        return read_app_info(target)
+    if zipfile.is_zipfile(str(target)):
+        return read_ipa_info(target)
+    return {
+        "path": str(target),
+        "root": str(target.parent),
+        "bundle_id": "",
+        "name": target.stem or target.name,
+        "version": "",
+        "build": "",
+        "executable": target.name,
+        "minimum_os": "",
+        "sinf": None,
+    }
+
+
+def _target_macho_bytes(
+    target: Path,
+    info: Optional[Dict[str, Any]] = None,
+) -> Tuple[bytes, bool, bool, Dict[str, Any]]:
+    """Return (arm64 bytes, was_encrypted, was_decrypted, info)."""
+    if info is None:
+        info = _target_info(target)
+    if target.is_dir():
+        data = _slice_blob((target / info["executable"]).read_bytes())
+        return data, is_macho_encrypted(data), False, info
+    if zipfile.is_zipfile(str(target)):
+        data = read_ipa_executable(target, info)
+        encrypted = is_macho_encrypted(data)
+        if encrypted:
+            if not info.get("sinf"):
+                raise CliError(
+                    "IPA is encrypted but has no SC_Info license; "
+                    "cannot decrypt %s" % target
+                )
+            data = _decrypt_for_extract(target, info)
+            return data, True, True, info
+        return data, False, False, info
+    data = _slice_blob(target.read_bytes())
+    return data, is_macho_encrypted(data), False, info
 
 
 def _extract_local(
     target: Union[str, Path],
     output: Optional[str] = None,
     force: bool = False,
-) -> Path:
+    exec_hook: str = "",
+) -> Dict[str, Any]:
+    """Extract the arm64 slice from an IPA, .app bundle, or raw Mach-O."""
     target = Path(target).expanduser()
     if not target.exists():
         raise CliError("input not found: %s" % target)
+    info = _target_info(target)
     dest = (
-        Path(output).expanduser()
+        Path(format_template(output, info)).expanduser()
         if output
         else _default_extract_output(target)
     )
     if dest.exists() and not force:
         raise CliError("output already exists (use --force): %s" % dest)
-    return _write_binary(_local_macho_bytes(target), dest)
+    data, encrypted, decrypted, info = _target_macho_bytes(target, info)
+    if encrypted and not decrypted:
+        log("warning: the extracted image is still FairPlay-encrypted")
+    _write_binary(data, dest)
+    log("extracted arm64 slice: %s" % dest)
+    if exec_hook:
+        run_exec_hook(exec_hook, dest, info)
+    return {
+        "ok": True,
+        "command": "extract",
+        "input": str(target),
+        "artifact": str(dest),
+        "encrypted": encrypted,
+        "decrypted": decrypted,
+        **_info_summary(info),
+        "external_id": "",
+    }
 
 
 def extract_binary(
@@ -2439,9 +2561,10 @@ def extract_binary(
     output: Optional[str] = None,
     *,
     force: bool = False,
+    exec_hook: str = "",
 ) -> Path:
-    """Extract the arm64 slice from a local IPA or Mach-O file."""
-    return _extract_local(path, output, force)
+    """Extract the arm64 slice from a local IPA, .app, or Mach-O file."""
+    return Path(_extract_local(path, output, force, exec_hook)["artifact"])
 
 
 def load_macho(
@@ -2451,7 +2574,10 @@ def load_macho(
     """Return arm64 Mach-O bytes for a local path or an App Store query."""
     target = Path(path_or_query).expanduser()
     if target.exists():
-        return _local_macho_bytes(target)
+        data, encrypted, decrypted, _ = _target_macho_bytes(target)
+        if encrypted and not decrypted:
+            log("warning: the Mach-O image is still FairPlay-encrypted")
+        return data
     with tempfile.TemporaryDirectory(prefix="ipa-dlp-macho-") as work:
         ipa = download(
             str(path_or_query),
@@ -2583,6 +2709,26 @@ def build_parser() -> argparse.ArgumentParser:
     decrypt.add_argument("--force", action="store_true")
     decrypt.add_argument("--reveal", action="store_true")
     decrypt.set_defaults(func=cmd_decrypt)
+
+    extract = subparsers.add_parser(
+        "extract",
+        help="extract the arm64 Mach-O slice from an IPA, .app, or binary",
+    )
+    extract.add_argument("target", help="path to an .ipa, .app, or Mach-O file")
+    extract.add_argument(
+        "-o",
+        "--output",
+        help="output binary path; supports %%(name)s-style tokens",
+    )
+    extract.add_argument(
+        "--exec",
+        dest="exec_cmd",
+        metavar="CMD",
+        help="run CMD after success; {} becomes the binary path and app "
+        "tokens like %%(name)s are expanded",
+    )
+    extract.add_argument("--force", action="store_true")
+    extract.set_defaults(func=cmd_extract)
 
     status = subparsers.add_parser("status", help="show tools, account, and model state")
     status.set_defaults(func=cmd_status)
