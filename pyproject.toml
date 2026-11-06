@@ -1,0 +1,15 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "ipa-dlp"
+version = "0.3.0"
+description = "Fetch, decrypt, and inspect personalized App Store IPAs."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Benjamin Liou" }]
+
+[project.scripts]
+ipa-dlp = "ipa_dlp:main"

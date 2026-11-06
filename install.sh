@@ -47,6 +47,7 @@ PY
 
 mkdir -p "$HOME/.local/bin"
 install -m 755 "$SRC_DIR/ipa-dlp" "$HOME/.local/bin/ipa-dlp"
+install -m 644 "$SRC_DIR/ipa_dlp.py" "$HOME/.local/bin/ipa_dlp.py"
 
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
@@ -74,6 +75,7 @@ fi
 echo
 echo "Installed:"
 echo "  $HOME/.local/bin/ipa-dlp"
+echo "  $HOME/.local/bin/ipa_dlp.py"
 echo
 
 if [ "$RUN_SETUP" = 1 ]; then

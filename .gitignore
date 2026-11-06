@@ -22,3 +22,6 @@ models/
 .vscode/
 .idea/
 *.swp
+
+# PyPI build artifacts
+dist/

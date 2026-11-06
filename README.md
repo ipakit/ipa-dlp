@@ -57,8 +57,9 @@ cd ipa-dlp
 ./install.sh
 ```
 
-This installs `~/.local/bin/ipa-dlp` and then runs `ipa-dlp setup`. No `sudo`
-is needed to install the wrapper; the first decryption asks for admin once.
+This installs the `ipa-dlp` entrypoint and its `ipa_dlp.py` module into
+`~/.local/bin/`, then runs `ipa-dlp setup`. No `sudo` is needed; the first
+decryption asks for admin once.
 
 If `~/.local/bin` is not on your `PATH`:
 
@@ -67,6 +68,18 @@ If `~/.local/bin` is not on your `PATH`:
 ```
 
 or call the full path.
+
+### pipx / pip
+
+`pyproject.toml` describes a PEP 621 package with a `flit_core` backend and
+no runtime dependencies, so the CLI can also be installed like any other
+Python tool:
+
+```sh
+pipx install .
+# or
+python3 -m pip install .
+```
 
 ## Use
 
@@ -161,6 +174,40 @@ after the artifacts are kept.
 
 `ipa-dlp decrypt` supports `-o` templates and `--exec` too; `%(external_id)s`
 is empty there because the input's version ID is not resolved.
+
+### JSON output
+
+`--json` prints exactly one JSON object on stdout and keeps all progress and
+diagnostics on stderr, so a pipeline can parse it without stripping noise:
+
+```sh
+ipa-dlp --json get spotify --version 9.1.88 > result.json
+ipa-dlp --json get spotify --list-versions --limit 5
+ipa-dlp --json status
+```
+
+Results carry `ok`, `command`, the resolved app, `external_id`, the
+`artifact` path, `ipa`/`binary` paths where relevant, `verified`, and
+`account_data_stripped`. `--list-versions` returns a `versions` array. A
+failure still prints one object, `{"ok": false, "error": "..."}`, and
+exits non-zero. With `--exec`, the hook's stdout is redirected to stderr so
+the object stays alone on stdout.
+
+### Library API
+
+`ipa_dlp` is importable and has no third-party dependencies:
+
+```python
+from ipa_dlp import download, decrypt, extract_binary, load_macho
+
+ipa = download("spotify", version="9.1.88")    # -> Path (decrypted IPA)
+ipa = decrypt("/path/to/App.ipa", output="App.ipa")
+bin_path = extract_binary(ipa)                   # -> Path (<base>.bin)
+data = load_macho("spotify", version="9.1.88")  # -> bytes (arm64 slice)
+```
+
+Each function returns its result instead of printing it. Pass `exec_hook=` or
+`reveal=True` only when the side effects are wanted.
 
 Other commands:
 
@@ -287,7 +334,9 @@ Terminal prompts are the default, which works over SSH and in scripts. Pass
 Useful checks:
 
 ```sh
-python3 -m py_compile ipa-dlp
+python3 -m py_compile ipa_dlp.py ipa-dlp
 ipa-dlp status
+ipa-dlp --json status
 ipa-dlp get spotify --version 9.1.88 --dry-run
+python3 -m build          # wheel + sdist (needs flit_core)
 ```
