@@ -2718,8 +2718,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog=APP,
-        description="Fetch and decrypt personalized App Store IPAs.",
+        description="Fetch, decrypt, and extract App Store IPAs and Mach-O binaries.",
         parents=[common],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  ipa-dlp get spotify --version 9.1.88\n"
+            "  ipa-dlp get spotify -v 9.1.88 --extract-binary\n"
+            "  ipa-dlp get spotify -F --limit 15\n"
+            "  ipa-dlp extract ./Spotify.ipa -o Spotify.bin\n"
+            "  ipa-dlp get spotify -v 9.1.88 --json\n\n"
+            "python api:\n"
+            "  from ipa_dlp import load_macho, download, extract_binary\n"
+            "  blob = load_macho('spotify', version='9.1.88')  # arm64 Mach-O bytes\n"
+        ),
     )
     parser.add_argument("--version", action="version", version="%s %s" % (APP, VERSION))
     subparsers = parser.add_subparsers(dest="command", required=True)
