@@ -146,6 +146,36 @@ Universal ("fat") executables are reduced to the arm64 slice (falling back to
 x86_64), written with mode `0755`, and the `.bin` path is what gets printed on
 stdout. The IPA is still written; pass `--force` to replace an existing `.bin`.
 
+### Output templates and hooks
+
+`-o` and `--exec` accept tokens expanded from the downloaded app's
+`Info.plist`:
+
+| Token | Value |
+| --- | --- |
+| `%(name)s` | app display name |
+| `%(bundle_id)s` | bundle identifier |
+| `%(version)s` | `CFBundleShortVersionString` |
+| `%(build)s` | `CFBundleVersion` |
+| `%(external_id)s` | Apple external version ID, when known |
+
+```sh
+ipa-dlp get spotify --version 9.1.88 \
+  -o '~/Research/spotify/%(version)s-%(build)s.ipa'
+
+ipa-dlp get spotify --version 9.1.88 --extract-binary \
+  --exec 'cp "{}" ~/Research/spotify/current.bin'
+```
+
+`--exec` runs after the artifacts are written. `{}` is replaced with the final
+artifact path — the `.bin` when `--extract-binary` is set, otherwise the
+`.ipa` — and the command runs through the shell. Expansion uses Python
+`%`-formatting, so write `%%` for a literal `%`. A failing hook exits non-zero
+after the artifacts are kept.
+
+`ipa-dlp decrypt` supports `-o` templates and `--exec` too; `%(external_id)s`
+is empty there because the input's version ID is not resolved.
+
 Other commands:
 
 ```sh

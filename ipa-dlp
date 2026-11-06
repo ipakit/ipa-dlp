@@ -1626,6 +1626,49 @@ def binary_path(output: Path) -> Path:
     return base.parent / (base.name + ".bin")
 
 
+def format_template(
+    template: str,
+    info: Dict[str, Any],
+    external_id: str = "",
+) -> str:
+    """Expand %(name)s-style tokens from *info* in an output or hook string."""
+    values = {
+        "name": info.get("name", ""),
+        "bundle_id": info.get("bundle_id", ""),
+        "version": info.get("version", ""),
+        "build": info.get("build", ""),
+        "external_id": external_id,
+    }
+    try:
+        return template % values
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CliError(
+            "could not expand template %r: %s (known tokens: %%(name)s, "
+            "%%(bundle_id)s, %%(version)s, %%(build)s, %%(external_id)s; "
+            "use %%%% for a literal %%)" % (template, exc)
+        ) from exc
+
+
+def run_exec_hook(
+    cmd_template: str,
+    target_path: Path,
+    info: Dict[str, Any],
+    external_id: str = "",
+) -> None:
+    """Run a shell hook with templates expanded and {} = *target_path*."""
+    cmd = format_template(cmd_template, info, external_id).replace(
+        "{}", str(target_path)
+    )
+    log("running hook: %s" % cmd)
+    vlog("+ " + cmd)
+    try:
+        subprocess.run(cmd, shell=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise CliError(
+            "--exec hook failed (exit %s): %s" % (exc.returncode, cmd)
+        ) from exc
+
+
 def verify_stripped_ipa(path: Path) -> None:
     """Fail closed when a supposedly stripped IPA still has account data."""
     try:
@@ -1822,6 +1865,7 @@ def get_flow(
     list_versions: bool = False,
     limit: int = 30,
     extract_binary: bool = False,
+    exec_hook: str = "",
 ) -> Path:
     ensure_tools()
     ensure_auth()
@@ -1864,7 +1908,11 @@ def get_flow(
                 "downloaded version %s does not match requested %s"
                 % (info.get("version"), version)
             )
-        destination = Path(output).expanduser() if output else default_output(info)
+        destination = (
+            Path(format_template(output, info, external_id)).expanduser()
+            if output
+            else default_output(info)
+        )
         binary_dest = binary_path(destination) if extract_binary else None
         if binary_dest is not None and binary_dest.exists() and not force:
             raise CliError(
@@ -1907,6 +1955,8 @@ def get_flow(
         eprint("encrypted IPA: %s" % encrypted_path(destination))
         eprint("report: %s" % report_path(destination))
     eprint("done.")
+    if exec_hook:
+        run_exec_hook(exec_hook, artifact, info, external_id)
     if reveal:
         subprocess.run(["open", "-R", str(artifact)], check=False)
     return destination
@@ -1928,6 +1978,7 @@ def cmd_get(args: argparse.Namespace) -> int:
         list_versions=args.list_versions,
         limit=args.limit,
         extract_binary=args.extract_binary,
+        exec_hook=args.exec_cmd or "",
     )
     return 0
 
@@ -1939,7 +1990,9 @@ def cmd_decrypt(args: argparse.Namespace) -> int:
         raise CliError("IPA not found: %s" % ipa)
     info = read_ipa_info(ipa)
     destination = (
-        Path(args.output).expanduser() if args.output else default_output(info)
+        Path(format_template(args.output, info)).expanduser()
+        if args.output
+        else default_output(info)
     )
     binary_dest = binary_path(destination) if args.extract_binary else None
     if binary_dest is not None and binary_dest.exists() and not args.force:
@@ -1967,6 +2020,8 @@ def cmd_decrypt(args: argparse.Namespace) -> int:
     if args.full:
         eprint("report: %s" % report_path(destination))
     eprint("done.")
+    if args.exec_cmd:
+        run_exec_hook(args.exec_cmd, artifact, info)
     if args.reveal:
         subprocess.run(["open", "-R", str(artifact)], check=False)
     return 0
@@ -2109,6 +2164,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also extract the arm64 Mach-O executable to <output>.bin",
     )
+    get.add_argument(
+        "--exec",
+        dest="exec_cmd",
+        metavar="CMD",
+        help="run CMD after a successful fetch; {} becomes the final artifact "
+        "path and %%(name)s, %%(bundle_id)s, %%(version)s, %%(build)s and "
+        "%%(external_id)s are expanded (use %%%% for a literal %%)",
+    )
     get.add_argument("--platform", default=DEFAULT_PLATFORM)
     get.add_argument(
         "--keep-account-data",
@@ -2149,6 +2212,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--extract-binary",
         action="store_true",
         help="also extract the arm64 Mach-O executable to <output>.bin",
+    )
+    decrypt.add_argument(
+        "--exec",
+        dest="exec_cmd",
+        metavar="CMD",
+        help="run CMD after success; {} becomes the final artifact path and "
+        "app tokens like %%(name)s are expanded",
     )
     decrypt.add_argument("--force", action="store_true")
     decrypt.add_argument("--reveal", action="store_true")
