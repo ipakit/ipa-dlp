@@ -49,6 +49,17 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 "$SRC_DIR/ipa-dlp" "$HOME/.local/bin/ipa-dlp"
 install -m 644 "$SRC_DIR/ipa_dlp.py" "$HOME/.local/bin/ipa_dlp.py"
 
+# Make `import ipa_dlp` work from arbitrary scripts, not just from the
+# ipa-dlp entrypoint (whose sys.path[0] is ~/.local/bin).
+USER_SITE="$("$PYTHON" -m site --user-site 2>/dev/null || true)"
+if [ -n "$USER_SITE" ]; then
+    mkdir -p "$USER_SITE"
+    printf '%s\n' "$HOME/.local/bin" > "$USER_SITE/ipa_dlp.pth"
+else
+    echo "Warning: could not find the Python user site-packages directory." >&2
+    echo "         Set PYTHONPATH=$HOME/.local/bin to import ipa_dlp." >&2
+fi
+
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *)
@@ -76,6 +87,9 @@ echo
 echo "Installed:"
 echo "  $HOME/.local/bin/ipa-dlp"
 echo "  $HOME/.local/bin/ipa_dlp.py"
+if [ -n "${USER_SITE:-}" ]; then
+    echo "  $USER_SITE/ipa_dlp.pth"
+fi
 echo
 
 if [ "$RUN_SETUP" = 1 ]; then
