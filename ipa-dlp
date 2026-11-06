@@ -1943,18 +1943,18 @@ def get_flow(
 
     artifact = binary_dest if binary_dest is not None else destination
     print(str(artifact))
-    eprint("decrypted IPA: %s" % destination)
+    log("decrypted IPA: %s" % destination)
     if binary_dest is not None:
-        eprint("binary: %s" % binary_dest)
-    eprint("verified: %s" % ("yes" if report.get("PlaintextVerified") else "no"))
+        log("binary: %s" % binary_dest)
+    log("verified: %s" % ("yes" if report.get("PlaintextVerified") else "no"))
     if keep_account_data:
-        eprint("account data stripped: no (kept by request)")
+        log("account data stripped: no (kept by request)")
     else:
-        eprint("account data stripped: yes")
+        log("account data stripped: yes")
     if full_output:
-        eprint("encrypted IPA: %s" % encrypted_path(destination))
-        eprint("report: %s" % report_path(destination))
-    eprint("done.")
+        log("encrypted IPA: %s" % encrypted_path(destination))
+        log("report: %s" % report_path(destination))
+    log("done.")
     if exec_hook:
         run_exec_hook(exec_hook, artifact, info, external_id)
     if reveal:
@@ -2009,17 +2009,17 @@ def cmd_decrypt(args: argparse.Namespace) -> int:
         extract_macho_binary(destination, info, binary_dest)
     artifact = binary_dest if binary_dest is not None else destination
     print(str(artifact))
-    eprint("decrypted IPA: %s" % destination)
+    log("decrypted IPA: %s" % destination)
     if binary_dest is not None:
-        eprint("binary: %s" % binary_dest)
-    eprint("verified: %s" % ("yes" if report.get("PlaintextVerified") else "no"))
+        log("binary: %s" % binary_dest)
+    log("verified: %s" % ("yes" if report.get("PlaintextVerified") else "no"))
     if args.keep_account_data:
-        eprint("account data stripped: no (kept by request)")
+        log("account data stripped: no (kept by request)")
     else:
-        eprint("account data stripped: yes")
+        log("account data stripped: yes")
     if args.full:
-        eprint("report: %s" % report_path(destination))
-    eprint("done.")
+        log("report: %s" % report_path(destination))
+    log("done.")
     if args.exec_cmd:
         run_exec_hook(args.exec_cmd, artifact, info)
     if args.reveal:
@@ -2047,64 +2047,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("data:       %s" % DATA_DIR)
     print("cache:      %s" % CACHE_DIR)
     return 0
-
-
-def cmd_wizard(args: argparse.Namespace) -> int:
-    ensure_tools()
-    ensure_auth()
-    config = read_config()
-    query = ask_text(
-        "ipa-dlp",
-        "App name, bundle ID, or App Store ID:",
-        default=str(config.get("last_app", "")),
-    )
-    version = ask_text(
-        "ipa-dlp",
-        "Version (leave blank for latest):",
-        allow_empty=True,
-    ).strip()
-    try:
-        destination = get_flow(
-            query,
-            version,
-            None,
-            keep_account_data=False,
-            force=False,
-            external_version_id="",
-            platform_name=DEFAULT_PLATFORM,
-            dry_run=False,
-            reveal=True,
-            purchase=False,
-            full_output=False,
-        )
-        config["last_app"] = query
-        save_config(config)
-        if gui_enabled():
-            osa(
-                r"""
-on run argv
-    display dialog (item 1 of argv) with title "ipa-dlp" buttons {"OK"} default button "OK"
-end run
-""",
-                "Decrypted and account-stripped IPA:\n\n%s" % destination,
-            )
-        return 0
-    except Cancelled:
-        raise
-    except CliError as exc:
-        if gui_enabled():
-            try:
-                osa(
-                    r"""
-on run argv
-    display alert "ipa-dlp" message (item 1 of argv) as critical buttons {"OK"} default button "OK"
-end run
-""",
-                    str(exc),
-                )
-            except Exception:
-                pass
-        raise
 
 
 # ---------------------------------------------------------------------------
@@ -2227,9 +2169,6 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show tools, account, and model state")
     status.set_defaults(func=cmd_status)
 
-    wizard = subparsers.add_parser("wizard", help="popup-driven app picker")
-    wizard.set_defaults(func=cmd_wizard)
-
     return parser
 
 
@@ -2240,7 +2179,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     parser = build_parser()
     args = parser.parse_args(argv)
-    USE_GUI = args.gui or args.command == "wizard"
+    USE_GUI = bool(args.gui)
     VERBOSE = bool(args.verbose)
     if os.geteuid() == 0:
         eprint(
@@ -2253,16 +2192,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         return int(args.func(args))
     except Cancelled:
-        eprint("canceled")
+        log("canceled")
         return 130
     except CliError as exc:
         eprint("error: %s" % exc)
         return 1
     except EOFError:
-        eprint("canceled (no input)")
+        log("canceled (no input)")
         return 130
     except KeyboardInterrupt:
-        eprint("interrupted")
+        log("interrupted")
         return 130
 
 

@@ -45,9 +45,8 @@ if sys.version_info < (3, 9):
     sys.exit("Python 3.9 or newer is required (found %s)" % sys.version.split()[0])
 PY
 
-mkdir -p "$HOME/.local/bin" "$HOME/Applications"
+mkdir -p "$HOME/.local/bin"
 install -m 755 "$SRC_DIR/ipa-dlp" "$HOME/.local/bin/ipa-dlp"
-install -m 755 "$SRC_DIR/ipa-dlp.command" "$HOME/Applications/ipa-dlp.command"
 
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
@@ -75,7 +74,6 @@ fi
 echo
 echo "Installed:"
 echo "  $HOME/.local/bin/ipa-dlp"
-echo "  $HOME/Applications/ipa-dlp.command"
 echo
 
 if [ "$RUN_SETUP" = 1 ]; then

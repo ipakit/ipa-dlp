@@ -49,9 +49,6 @@ Then:
 ipa-dlp setup
 ```
 
-The formula also ships the double-clickable wizard; `brew info ipa-dlp` prints
-the one-line command to copy `ipa-dlp.command` into `~/Applications`.
-
 ### From source
 
 ```sh
@@ -60,13 +57,8 @@ cd ipa-dlp
 ./install.sh
 ```
 
-This installs:
-
-- `~/.local/bin/ipa-dlp` — the CLI
-- `~/Applications/ipa-dlp.command` — a double-clickable wizard
-
-and then runs `ipa-dlp setup`. No `sudo` is needed to install the wrapper;
-the first decryption asks for admin once.
+This installs `~/.local/bin/ipa-dlp` and then runs `ipa-dlp setup`. No `sudo`
+is needed to install the wrapper; the first decryption asks for admin once.
 
 If `~/.local/bin` is not on your `PATH`:
 
@@ -77,12 +69,6 @@ If `~/.local/bin` is not on your `PATH`:
 or call the full path.
 
 ## Use
-
-### Popup wizard
-
-Double-click `~/Applications/ipa-dlp.command`, enter an app name (or bundle
-ID / App Store numeric ID), and optionally enter a version. The output is
-account-stripped automatically.
 
 ### CLI
 
@@ -295,12 +281,13 @@ IPADLP_DATA_DIR=/tmp/ipa-dlp-data
 UNFAIRPLAY_MODEL_DIR=/tmp/unfairplay-models
 ```
 
-`--no-gui` forces terminal prompts, which is useful for debugging and SSH.
+Terminal prompts are the default, which works over SSH and in scripts. Pass
+`--gui` to use native macOS dialogs instead.
 
 Useful checks:
 
 ```sh
 python3 -m py_compile ipa-dlp
-ipa-dlp --no-gui status
-ipa-dlp --no-gui get spotify --version 9.1.88 --dry-run
+ipa-dlp status
+ipa-dlp get spotify --version 9.1.88 --dry-run
 ```
