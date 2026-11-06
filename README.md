@@ -1,7 +1,9 @@
 # ipa-dlp
 
-A small macOS wrapper around [ipatool](https://github.com/majd/ipatool) and
-[UnfairPlay](https://github.com/DrWhax/unfairplay) that turns this:
+A macOS CLI and Python library for fetching, decrypting, and extracting App
+Store IPAs and Mach-O binaries (powered by
+[ipatool](https://github.com/majd/ipatool) and
+[UnfairPlay](https://github.com/DrWhax/unfairplay)). It turns this:
 
 ```sh
 ipatool auth login ...
@@ -16,11 +18,12 @@ into this:
 ipa-dlp get spotify --version 9.1.88
 ```
 
-It prompts for your Apple ID through native dialogs (including 2FA), installs
-pinned copies of both tools under your home directory, recovers the reusable
-FairPlay model on first use with one admin prompt, downloads the requested app
-version, decrypts it, strips the App Store account data, and verifies the
-plaintext before reporting success.
+It prompts for your Apple ID in the terminal (including 2FA) by default;
+`--gui` switches to native macOS dialogs. It installs pinned copies of both
+tools under your home directory, recovers the reusable FairPlay model on first
+use with one admin prompt, downloads the requested app version, decrypts it,
+strips the App Store account data, and verifies the plaintext before reporting
+success.
 
 ## Requirements
 
@@ -58,8 +61,10 @@ cd ipa-dlp
 ```
 
 This installs the `ipa-dlp` entrypoint and its `ipa_dlp.py` module into
-`~/.local/bin/`, then runs `ipa-dlp setup`. No `sudo` is needed; the first
-decryption asks for admin once.
+`~/.local/bin/`, registers that directory in the Python user site-packages
+(`ipa_dlp.pth`) so `import ipa_dlp` works from any script, then runs
+`ipa-dlp setup`. No `sudo` is needed; the first decryption asks for admin
+once.
 
 If `~/.local/bin` is not on your `PATH`:
 
@@ -76,9 +81,9 @@ no runtime dependencies, so the CLI can also be installed like any other
 Python tool:
 
 ```sh
-pipx install .
+pipx install ipa-dlp
 # or
-python3 -m pip install .
+python3 -m pip install ipa-dlp
 ```
 
 ## Use
@@ -103,7 +108,7 @@ The default output is:
 
 Account data is stripped by default: `SC_Info` licenses are removed and the
 Apple ID/purchaser fields are scrubbed from `iTunesMetadata.plist`.
-The wrapper checks the decryption report and the output archive
+ipa-dlp checks the decryption report and the output archive
 before printing `account data stripped: yes`; if either check fails,
 it deletes the output and exits with an error.
 
@@ -245,7 +250,7 @@ ipa-dlp setup --seed spotify --version 9.1.88
 
 ### Version selection
 
-`--version` matches the IPA's `CFBundleShortVersionString`. The wrapper
+`--version` matches the IPA's `CFBundleShortVersionString`. ipa-dlp
 maps it to Apple's external version identifier by asking the App Store for
 metadata, newest versions first, and caches the mapping in
 `~/Library/Caches/ipa-dlp/versions/`. Very old versions can take longer to
@@ -280,7 +285,7 @@ version that is no longer listed.
 Free apps are licensed automatically when needed. For a paid app, buy it in the
 App Store first; downloading an owned paid app works without extra flags.
 `--purchase` asks Apple to obtain a missing license, which can charge your
-account, so the wrapper asks for confirmation before using it on a paid app.
+account, so ipa-dlp asks for confirmation before using it on a paid app.
 
 ```sh
 ipa-dlp get some-paid-app --purchase
@@ -290,13 +295,15 @@ ipa-dlp get some-paid-app --purchase
 
 1. Pinned `ipatool 2.7.0` and `UnfairPlay 0.2.0` releases are downloaded and
    SHA-256 verified into `~/.local/share/ipa-dlp/bin/`.
-2. An Apple ID/password dialog appears. The password is fed to `ipatool` over a
-   PTY, not as a command-line argument, and is not stored. If Apple asks for a
-   2FA code, a second dialog appears.
+2. You are prompted for your Apple ID and password in the terminal. The
+   password is fed to `ipatool` over a PTY, not as a command-line argument, and
+   is not stored. If Apple asks for a 2FA code, you are prompted for it. Pass
+   `--gui` to use native macOS dialogs instead.
 3. `setup` checks the App Store session and reports the signed-in account.
 4. On the first `get`, the IPA is downloaded, its app bundle is unpacked, and
-   `UnfairPlay` recovers the enrollment model. macOS shows one admin password
-   dialog for this step. The model is saved under
+   `UnfairPlay` recovers the enrollment model. You are asked for your login
+   password once (in the terminal by default, or in a macOS dialog with
+   `--gui`). The model is saved under
    `~/Library/Application Support/unfairplay/models` and reused for later IPAs
    from the same enrollment/account.
 5. The IPA is decrypted, account data is stripped, and the output is checked
@@ -306,11 +313,11 @@ Later `get` calls do not need the admin password.
 
 ## Important limitations
 
-- **Spotify's iOS app is not in the Mac App Store.** The wrapper does not need
+- **Spotify's iOS app is not in the Mac App Store.** ipa-dlp does not need
   a Mac App Store-installed app: it uses the app bundle from the downloaded IPA
   as the enrollment sample. This is what made the Spotify 9.1.88 flow work.
 - **UnfairPlay is build-sensitive.** It may fail closed after a macOS update if
-  Apple changes the FairPlay state or `fairplayd`. The wrapper reports the error
+  Apple changes the FairPlay state or `fairplayd`. ipa-dlp reports the error
   instead of faking success.
 - **The model is tied to the Mac's enrollment and Apple ID.** If you sign in to
   a different account, use `ipa-dlp setup --reauth`; a different enrollment
@@ -324,7 +331,7 @@ Later `get` calls do not need the admin password.
   the Apple ID/purchaser fields are removed from `iTunesMetadata.plist`. Use
   `--keep-account-data` only when you need those licenses; such an IPA can
   identify your Apple ID.
-- **The wrapper only handles store-owned apps.** It cannot bypass Apple's
+- **Only store-owned apps are supported.** It cannot bypass Apple's
   licensing; if the account cannot obtain the app/version, the download fails.
 - **No App Store password is stored.** `ipatool` stores its own session token in
   the macOS Keychain. Revoke it with `ipatool auth revoke` if needed.
