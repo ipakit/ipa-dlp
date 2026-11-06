@@ -1062,8 +1062,8 @@ def _release_date(value: Any) -> str:
 
 
 def render_versions_table(rows: Sequence[Dict[str, str]]) -> None:
-    """Print an aligned EXT_ID / VERSION / RELEASED table to stdout."""
-    headers = ("EXT_ID", "VERSION", "RELEASED")
+    """Print an aligned EXTERNAL_ID / VERSION / RELEASE_DATE table."""
+    headers = ("EXTERNAL_ID", "VERSION", "RELEASE_DATE")
     width_id = max([len(headers[0])] + [len(row["external_id"]) for row in rows])
     width_version = max([len(headers[1])] + [len(row["version"]) for row in rows])
     print(

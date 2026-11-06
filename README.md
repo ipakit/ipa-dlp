@@ -265,15 +265,15 @@ ipa-dlp get spotify -F --limit 100         # newest 100
 The table goes to stdout:
 
 ```text
-EXT_ID     VERSION  RELEASED
-871294812  9.1.88   2026-03-14
-870912300  9.1.86   2026-03-07
+EXTERNAL_ID  VERSION  RELEASE_DATE
+871294812    9.1.88   2026-03-14
+870912300    9.1.86   2026-03-07
 ```
 
 Metadata for versions that were not resolved before is fetched in parallel and
 stored in the same version cache used by `--version`, so later runs are
-instant. Pipe an `EXT_ID` into `--external-version-id` to download a version
-that is no longer listed.
+instant. Pipe an `EXTERNAL_ID` into `--external-version-id` to download a
+version that is no longer listed.
 
 ### Licenses and paid apps
 
