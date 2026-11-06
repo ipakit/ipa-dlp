@@ -36,12 +36,12 @@ plaintext before reporting success.
 ### Homebrew (recommended)
 
 ```sh
-brew tap bejminliou/ipa-dlp
+brew tap ipakit/ipa-dlp
 brew install ipa-dlp
 ```
 
 If Homebrew complains that the tap is untrusted (some Homebrew 7 builds gate
-third-party taps), run `brew trust bejminliou/ipa-dlp` and retry.
+third-party taps), run `brew trust ipakit/ipa-dlp` and retry.
 
 Then:
 
@@ -55,7 +55,7 @@ the one-line command to copy `ipa-dlp.command` into `~/Applications`.
 ### From source
 
 ```sh
-git clone https://github.com/bejminliou/ipa-dlp.git
+git clone https://github.com/ipakit/ipa-dlp.git
 cd ipa-dlp
 ./install.sh
 ```

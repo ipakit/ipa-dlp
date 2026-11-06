@@ -23,8 +23,8 @@ else
 fi
 
 if [ -z "$IPADLP" ]; then
-    /usr/bin/osascript -e 'display alert "ipa-dlp is not installed" message "Run install.sh from the ipa-dlp folder, or: brew install bejminliou/ipa-dlp/ipa-dlp" as critical buttons {"OK"} default button "OK"' >/dev/null 2>&1 || true
-    echo "ipa-dlp is not installed. Run install.sh or brew install bejminliou/ipa-dlp/ipa-dlp." >&2
+    /usr/bin/osascript -e 'display alert "ipa-dlp is not installed" message "Run install.sh from the ipa-dlp folder, or: brew install ipakit/ipa-dlp/ipa-dlp" as critical buttons {"OK"} default button "OK"' >/dev/null 2>&1 || true
+    echo "ipa-dlp is not installed. Run install.sh or brew install ipakit/ipa-dlp/ipa-dlp." >&2
     read -r "?Press Return to close..."
     exit 1
 fi
