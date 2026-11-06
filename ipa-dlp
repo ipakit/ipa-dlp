@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 APP = "ipa-dlp"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 IPATOOL_VERSION = "2.7.0"
 IPATOOL_SHA256 = "5ae100d4520cf4b3f4374239e5925a9ad9a8dc02abc16bae27479e7ae99aca33"
 UNFAIRPLAY_VERSION = "0.2.0"
