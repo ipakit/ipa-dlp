@@ -15,7 +15,7 @@ unfairplay decrypt ...
 into this:
 
 ```sh
-ipa-dlp get spotify --version 9.1.88
+ipa-dlp get spotify@9.1.88
 ```
 
 It prompts for your Apple ID in the terminal (including 2FA) by default;
@@ -28,10 +28,7 @@ success.
 ## Requirements
 
 - Apple Silicon Mac (UnfairPlay's FairPlay recovery is arm64-only)
-- macOS with a working native App Store / FairPlay enrollment
-- Python 3.9+ (`/usr/bin/python3` from the Xcode Command Line Tools is enough)
-- Internet access
-- An Apple ID that owns or can obtain the requested apps
+- Python 3.9+ (`/usr/bin/python3` from Xcode Command Line Tools is enough)
 - Admin rights for the one-time model recovery
 
 ## Install
@@ -74,11 +71,7 @@ If `~/.local/bin` is not on your `PATH`:
 
 or call the full path.
 
-### pipx / pip
-
-`pyproject.toml` describes a PEP 621 package with a `flit_core` backend and
-no runtime dependencies, so the CLI can also be installed like any other
-Python tool:
+### pip / pipx
 
 ```sh
 pipx install ipa-dlp
@@ -93,6 +86,8 @@ python3 -m pip install ipa-dlp
 ```sh
 ipa-dlp setup
 ipa-dlp get spotify
+ipa-dlp get spotify@9.1.88
+ipa-dlp get spotify -v 9.1.88
 ipa-dlp get spotify --version 9.1.88
 ipa-dlp get com.spotify.client --version 9.1.88
 ipa-dlp get 324684580 --version 9.1.88
@@ -204,7 +199,7 @@ For `extract`, tokens are read from an IPA or `.app`; a raw Mach-O only has
 
 ### JSON output
 
-`--json` prints exactly one JSON object on stdout and keeps all progress and
+`--json` prints a JSON object on stdout and keeps all progress and
 diagnostics on stderr, so a pipeline can parse it without stripping noise:
 
 ```sh
@@ -221,8 +216,6 @@ exits non-zero. With `--exec`, the hook's stdout is redirected to stderr so
 the object stays alone on stdout.
 
 ### Library API
-
-`ipa_dlp` is importable and has no third-party dependencies:
 
 ```python
 from ipa_dlp import download, decrypt, extract_binary, load_macho
@@ -253,9 +246,7 @@ ipa-dlp setup --seed spotify --version 9.1.88
 `--version` matches the IPA's `CFBundleShortVersionString`. ipa-dlp
 maps it to Apple's external version identifier by asking the App Store for
 metadata, newest versions first, and caches the mapping in
-`~/Library/Caches/ipa-dlp/versions/`. ipa-dlp binary-searches the
-chronologically ordered version IDs, so even very old versions resolve in a
-handful of metadata requests. If the App Store will not serve a version to
+`~/Library/Caches/ipa-dlp/versions/`. If the App Store will not serve a version to
 your account, you get an error; `--external-version-id` lets you bypass the
 lookup once you know the ID.
 
@@ -319,26 +310,12 @@ Later `get` calls do not need the admin password.
 
 ## Important limitations
 
-- **Spotify's iOS app is not in the Mac App Store.** ipa-dlp does not need
-  a Mac App Store-installed app: it uses the app bundle from the downloaded IPA
-  as the enrollment sample. This is what made the Spotify 9.1.88 flow work.
 - **UnfairPlay is build-sensitive.** It may fail closed after a macOS update if
-  Apple changes the FairPlay state or `fairplayd`. ipa-dlp reports the error
-  instead of faking success.
+  Apple changes the FairPlay state or `fairplayd`. ipa-dlp reports the error.
 - **The model is tied to the Mac's enrollment and Apple ID.** If you sign in to
   a different account, use `ipa-dlp setup --reauth`; a different enrollment
   needs its own model.
-- **Old versions are not guaranteed.** Apple can refuse to serve a version that
-  was never associated with your account, or remove it from the version list.
-- **The output is decrypted but unsigned.** It will not install by
-  double-clicking. Use TrollStore, a signing tool, or PlayCover depending on
-  your target. UnfairPlay does not install apps.
-- **Account data is stripped by default.** `SC_Info` licenses are removed and
-  the Apple ID/purchaser fields are removed from `iTunesMetadata.plist`. Use
-  `--keep-account-data` only when you need those licenses; such an IPA can
-  identify your Apple ID.
-- **Only store-owned apps are supported.** It cannot bypass Apple's
-  licensing; if the account cannot obtain the app/version, the download fails.
+- **Only "store-owned" apps are supported.** If the account cannot obtain the app/version, the download fails.
 - **No App Store password is stored.** `ipatool` stores its own session token in
   the macOS Keychain. Revoke it with `ipatool auth revoke` if needed.
 
