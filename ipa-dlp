@@ -29,7 +29,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import termios
 import time
+import tty
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -61,7 +63,7 @@ MODEL_DIR = Path(
 CONFIG_PATH = DATA_DIR / "config.json"
 
 DEFAULT_PLATFORM = "iphone"
-USE_GUI = True
+USE_GUI = False
 VERBOSE = False
 
 # Kept in sync with UnfairPlay's --strip-account-data scrubber.
@@ -85,6 +87,23 @@ ACCOUNT_METADATA_KEYS = frozenset(
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
+def _use_color() -> bool:
+    """Return True when stderr is a TTY and NO_COLOR is not set."""
+    return sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+
+
+# Tag colors: cyan for ipa-dlp, green for ipatool, magenta for unfairplay,
+# blue for download, yellow for versions.
+_TAG_COLORS: Dict[str, str] = {
+    "ipa-dlp": "\x1b[36m",     # cyan
+    "ipatool": "\x1b[32m",     # green
+    "unfairplay": "\x1b[35m",  # magenta
+    "download": "\x1b[34m",    # blue
+    "versions": "\x1b[33m",    # yellow
+}
+_RESET = "\x1b[0m"
+
+
 class CliError(Exception):
     pass
 
@@ -103,8 +122,34 @@ def eprint(*args: Any, **kwargs: Any) -> None:
     print(*args, **kwargs)
 
 
-def log(message: str) -> None:
-    eprint(message)
+def log(message: str, tag: str = "ipa-dlp") -> None:
+    if _use_color():
+        color = _TAG_COLORS.get(tag, "")
+        reset = _RESET if color else ""
+        eprint("%s[%s]%s %s" % (color, tag, reset, message))
+    else:
+        eprint("[%s] %s" % (tag, message))
+
+
+def _progress_line(message: str, tag: str = "download") -> None:
+    """Overwrite the current line with a progress message (TTY only)."""
+    if sys.stderr.isatty():
+        if _use_color():
+            color = _TAG_COLORS.get(tag, "")
+            reset = _RESET if color else ""
+            sys.stderr.write("\r\x1b[K%s[%s]%s %s" % (color, tag, reset, message))
+        else:
+            sys.stderr.write("\r\x1b[K[%s] %s" % (tag, message))
+        sys.stderr.flush()
+    else:
+        eprint("[%s] %s" % (tag, message))
+
+
+def _finish_progress() -> None:
+    """End a progress line by writing a newline (TTY only)."""
+    if sys.stderr.isatty():
+        sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 def vlog(message: str) -> None:
@@ -348,9 +393,15 @@ def choose_item(title: str, prompt: str, items: List[str]) -> str:
             raise
         except CliError:
             pass
-    print(prompt)
+
+    # Arrow-key selector when stdin is a TTY.
+    if sys.stdin.isatty():
+        return _arrow_select(prompt, items)
+
+    # Dumb fallback for pipes / non-TTY.
+    eprint(prompt)
     for index, item in enumerate(items, 1):
-        print("  %d. %s" % (index, item))
+        eprint("  %d. %s" % (index, item))
     while True:
         try:
             answer = input("Select [1-%d]: " % len(items)).strip()
@@ -358,6 +409,77 @@ def choose_item(title: str, prompt: str, items: List[str]) -> str:
             raise CliError("selection canceled") from exc
         if answer.isdigit() and 1 <= int(answer) <= len(items):
             return items[int(answer) - 1]
+
+
+def _arrow_select(prompt: str, items: List[str]) -> str:
+    """Interactive ↑/↓/Enter selector drawn on stderr."""
+    selected = 0
+    # How many items to show at once (scrollable window).
+    max_visible = min(len(items), 12)
+    use_color = _use_color()
+
+    def _render(sel: int) -> None:
+        # Determine the visible window around the selection.
+        if len(items) <= max_visible:
+            start = 0
+        else:
+            start = max(0, min(sel - max_visible // 2, len(items) - max_visible))
+        end = start + max_visible
+        lines: list[str] = []
+        for i in range(start, end):
+            marker = "▸ " if i == sel else "  "
+            if i == sel and use_color:
+                lines.append("  \x1b[7m%s%s\x1b[0m" % (marker, items[i]))
+            else:
+                lines.append("  %s%s" % (marker, items[i]))
+        if len(items) > max_visible:
+            lines.append("  (%d items, ↑/↓ to scroll)" % len(items))
+        sys.stderr.write("\r\x1b[K" + prompt + "\n")
+        for line in lines:
+            sys.stderr.write("\r\x1b[K" + line + "\n")
+        # Move cursor back up to keep the selector in place.
+        total = 1 + len(lines)
+        sys.stderr.write("\x1b[%dA" % total)
+        sys.stderr.flush()
+
+    def _clear(line_count: int) -> None:
+        for _ in range(line_count):
+            sys.stderr.write("\r\x1b[K\n")
+        sys.stderr.write("\x1b[%dA" % line_count)
+        sys.stderr.flush()
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        _render(selected)
+        while True:
+            ch = os.read(fd, 1)
+            if ch == b"\r" or ch == b"\n":
+                break
+            if ch == b"\x03":  # Ctrl-C
+                raise KeyboardInterrupt
+            if ch == b"\x1b":
+                seq = os.read(fd, 2)
+                if seq == b"[A":  # Up
+                    selected = max(0, selected - 1)
+                elif seq == b"[B":  # Down
+                    selected = min(len(items) - 1, selected + 1)
+                _render(selected)
+            elif ch == b"k":
+                selected = max(0, selected - 1)
+                _render(selected)
+            elif ch == b"j":
+                selected = min(len(items) - 1, selected + 1)
+                _render(selected)
+            elif ch == b"q":
+                raise Cancelled()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        # Clear the selector UI.
+        extra = 1 if len(items) > max_visible else 0
+        _clear(1 + max_visible + extra)
+    return items[selected]
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +513,7 @@ def download(url: str, destination: Path, expected: Optional[str] = None) -> Non
     part = destination.with_name(destination.name + ".part")
     if part.exists():
         part.unlink()
-    log("downloading %s" % destination.name)
+    log("downloading %s" % destination.name, tag="download")
     completed = subprocess.run(
         [
             "curl",
@@ -486,7 +608,7 @@ def install_ipatool() -> None:
     finally:
         shutil.rmtree(root, ignore_errors=True)
     _record_tool_version("ipatool", IPATOOL_VERSION)
-    log("installed ipatool %s at %s" % (IPATOOL_VERSION, ipatool_path()))
+    log("installed ipatool %s at %s" % (IPATOOL_VERSION, ipatool_path()), tag="ipatool")
 
 
 def install_unfairplay() -> None:
@@ -507,7 +629,7 @@ def install_unfairplay() -> None:
     finally:
         shutil.rmtree(root, ignore_errors=True)
     _record_tool_version("unfairplay", UNFAIRPLAY_VERSION)
-    log("installed UnfairPlay %s at %s" % (UNFAIRPLAY_VERSION, unfairplay_path()))
+    log("installed UnfairPlay %s at %s" % (UNFAIRPLAY_VERSION, unfairplay_path()), tag="unfairplay")
 
 
 def _record_tool_version(name: str, version: str) -> None:
@@ -715,7 +837,7 @@ def ensure_auth(force: bool = False) -> Dict[str, Any]:
 
     last_output = ""
     for attempt in range(1, 4):
-        log("signing in to the App Store...")
+        log("signing in to the App Store...", tag="ipatool")
         code, output = login_pty(email, password, ask_code)
         last_output = output
         info = auth_info()
@@ -728,7 +850,7 @@ def ensure_auth(force: bool = False) -> Dict[str, Any]:
             )
             return info
         if attempt < 3:
-            log("login failed; %s" % tail(output, 1200))
+            log("login failed; %s" % tail(output, 1200), tag="ipatool")
             if not ask_yes_no(
                 "ipa-dlp",
                 "Apple ID login failed. Try again with a new password/code?",
@@ -975,11 +1097,16 @@ def resolve_version(
         for ext in chunk:
             metadata = versions.get(ext)
             if metadata and str(metadata.get("displayVersion")) == wanted:
+                _finish_progress()
                 return ext, metadata
 
         done = min(offset + chunk_size, len(ids))
-        log("searching versions: %d/%d" % (done, len(ids)))
+        _progress_line(
+            "Checking metadata: %d/%d" % (done, len(ids)),
+            tag="versions",
+        )
 
+    _finish_progress()
     raise CliError(
         "version %s was not found for app %s (latest available: %s); "
         "you can pass --external-version-id directly"
@@ -1026,6 +1153,8 @@ def run_with_progress(
     vlog("+ " + " ".join(cmd))
     started = time.time()
     last_report = 0.0
+    last_size = 0.0
+    last_speed_time = started
     output_chunks: list[str] = []
     try:
         process = subprocess.Popen(
@@ -1045,25 +1174,37 @@ def run_with_progress(
                 if chunk:
                     output_chunks.append(chunk.decode("utf-8", "replace"))
             now = time.time()
-            if now - last_report >= (2 if sys.stderr.isatty() else 15):
+            interval = 0.5 if sys.stderr.isatty() else 15
+            if now - last_report >= interval:
                 last_report = now
+                elapsed = now - started
                 if watch is not None and watch.exists():
                     megabytes = watch.stat().st_size / (1024 * 1024)
-                    eprint(
-                        "%s: %.1f MB (%.0fs)"
-                        % (label, megabytes, now - started)
+                    dt = now - last_speed_time
+                    speed = (megabytes - last_size) / dt if dt > 0 else 0.0
+                    last_size = megabytes
+                    last_speed_time = now
+                    elapsed_str = "%02d:%02d" % (int(elapsed) // 60, int(elapsed) % 60)
+                    _progress_line(
+                        "%.1fMiB at %.1fMiB/s (%s)" % (megabytes, speed, elapsed_str),
+                        tag="download",
                     )
                 else:
-                    eprint("%s: %.0fs" % (label, now - started))
+                    _progress_line(
+                        "%.0fs" % elapsed,
+                        tag="download",
+                    )
             if process.poll() is not None:
                 # Drain remaining output after process exits.
                 remaining = process.stdout.read()
                 if remaining:
                     output_chunks.append(remaining.decode("utf-8", "replace"))
                 break
+        _finish_progress()
         output = "".join(output_chunks)
         return process.returncode, output
     except Exception:
+        _finish_progress()
         raise
 
 
@@ -1228,8 +1369,8 @@ def ensure_model(
     if current and current.get("decrypt_ready"):
         return current
 
-    log("no matching FairPlay model; recovering the enrollment model")
-    log("macOS will ask for your login password once")
+    log("no matching FairPlay model; recovering the enrollment model", tag="unfairplay")
+    log("macOS will ask for your login password once", tag="unfairplay")
     cleanup: Optional[Path] = None
     if app_path is None:
         app_path, cleanup = extract_app(ipa)
@@ -1261,7 +1402,7 @@ def ensure_model(
             "warning: plaintext_verified=false; the model was saved but this "
             "IPA has no pre-encryption hash table"
         )
-    log("model saved: %s" % parsed.get("model", MODEL_DIR))
+    log("model saved: %s" % parsed.get("model", MODEL_DIR), tag="unfairplay")
 
     final = doctor(ipa)
     if not final or not final.get("decrypt_ready"):
@@ -1376,7 +1517,7 @@ def decrypt_ipa(
     if force:
         cmd.append("--force")
 
-    log("decrypting %s" % ipa.name)
+    log("decrypting %s" % ipa.name, tag="unfairplay")
     try:
         completed = run(cmd, timeout=1800, check=False)
         parsed = parse_json(
@@ -1395,7 +1536,7 @@ def decrypt_ipa(
         if full_output:
             report.chmod(0o600)
         if not parsed.get("PlaintextVerified"):
-            log("warning: plaintext verification was false for this IPA")
+            log("warning: plaintext verification was false for this IPA", tag="unfairplay")
 
         if not keep_account_data:
             if parsed.get("AccountDataStripped") is not True:
@@ -1517,9 +1658,9 @@ def get_flow(
         purchase = purchase or app_is_free(app)
         confirm_purchase(app, purchase)
         if purchase:
-            log("obtaining a free App Store license if needed")
+            log("obtaining a free App Store license if needed", tag="ipatool")
         info = download_ipa(app, external_id, platform_name, ipa, purchase)
-        log("downloaded: %s %s" % (info.get("name"), info.get("version")))
+        log("downloaded: %s %s" % (info.get("name"), info.get("version")), tag="download")
         if version and info.get("version") != version:
             raise CliError(
                 "downloaded version %s does not match requested %s"
@@ -1704,9 +1845,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version="%s %s" % (APP, VERSION))
     parser.add_argument(
-        "--no-gui",
+        "--gui",
         action="store_true",
-        help="use the terminal instead of macOS dialogs",
+        help="use macOS dialogs instead of terminal prompts",
     )
     parser.add_argument("--verbose", action="store_true", help="verbose command logging")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1787,7 +1928,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     parser = build_parser()
     args = parser.parse_args(argv)
-    USE_GUI = not args.no_gui
+    USE_GUI = args.gui or args.command == "wizard"
     VERBOSE = bool(args.verbose)
     if os.geteuid() == 0:
         eprint(
