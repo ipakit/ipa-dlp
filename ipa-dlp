@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 APP = "ipa-dlp"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 IPATOOL_VERSION = "2.7.0"
 IPATOOL_SHA256 = "5ae100d4520cf4b3f4374239e5925a9ad9a8dc02abc16bae27479e7ae99aca33"
 UNFAIRPLAY_VERSION = "0.2.0"
@@ -485,6 +485,7 @@ def install_ipatool() -> None:
         install_binary(find_binary(root, "ipatool"), ipatool_path())
     finally:
         shutil.rmtree(root, ignore_errors=True)
+    _record_tool_version("ipatool", IPATOOL_VERSION)
     log("installed ipatool %s at %s" % (IPATOOL_VERSION, ipatool_path()))
 
 
@@ -505,7 +506,36 @@ def install_unfairplay() -> None:
                 shutil.copy2(str(item), str(license_dir / item.name))
     finally:
         shutil.rmtree(root, ignore_errors=True)
+    _record_tool_version("unfairplay", UNFAIRPLAY_VERSION)
     log("installed UnfairPlay %s at %s" % (UNFAIRPLAY_VERSION, unfairplay_path()))
+
+
+def _record_tool_version(name: str, version: str) -> None:
+    """Persist the installed tool version in config.json for fast startup checks."""
+    config = read_config()
+    tools = config.get("tool_versions")
+    if not isinstance(tools, dict):
+        tools = {}
+    tools[name] = version
+    config["tool_versions"] = tools
+    save_config(config)
+
+
+def _tool_version_ok(name: str, path: Path, expected: str) -> bool:
+    """Return True if the tool at *path* is the expected version.
+
+    Checks config.json first (fast path), falls back to ``--version`` only when
+    the recorded version is missing or stale.
+    """
+    if not path.exists():
+        return False
+    config = read_config()
+    recorded = (config.get("tool_versions") or {}).get(name)
+    if recorded == expected and os.access(str(path), os.X_OK):
+        return True
+    # Slow path: actually spawn the binary.
+    version = tool_version(path)
+    return expected in version
 
 
 def ensure_tools(update: bool = False) -> None:
@@ -521,8 +551,7 @@ def ensure_tools(update: bool = False) -> None:
 
     need_ipatool = update or not ipatool.exists()
     if not need_ipatool:
-        version = tool_version(ipatool)
-        need_ipatool = IPATOOL_VERSION not in version
+        need_ipatool = not _tool_version_ok("ipatool", ipatool, IPATOOL_VERSION)
     if need_ipatool:
         if os.environ.get("IPADLP_IPATOOL"):
             raise CliError(
@@ -533,8 +562,7 @@ def ensure_tools(update: bool = False) -> None:
 
     need_unfairplay = update or not unfairplay.exists()
     if not need_unfairplay:
-        version = tool_version(unfairplay)
-        need_unfairplay = UNFAIRPLAY_VERSION not in version
+        need_unfairplay = not _tool_version_ok("unfairplay", unfairplay, UNFAIRPLAY_VERSION)
     if need_unfairplay:
         if os.environ.get("IPADLP_UNFAIRPLAY"):
             raise CliError(
@@ -917,6 +945,11 @@ def resolve_version(
         cache = {"app_id": app_id, "versions": {}}
     versions: Dict[str, Any] = cache["versions"]
 
+    # Fast path: return immediately if the wanted version is already cached.
+    for ext, metadata in versions.items():
+        if isinstance(metadata, dict) and str(metadata.get("displayVersion")) == wanted:
+            return ext, metadata
+
     ids = list_external_versions(app_id)
     if not ids:
         raise CliError("App Store returned no versions for app %s" % app_id)
@@ -991,39 +1024,47 @@ def run_with_progress(
 ) -> Tuple[int, str]:
     cmd = [str(item) for item in argv]
     vlog("+ " + " ".join(cmd))
-    log_fd, log_name = tempfile.mkstemp(prefix="ipa-dlp-run-", suffix=".log")
-    os.close(log_fd)
-    log_path = Path(log_name)
     started = time.time()
     last_report = 0.0
+    output_chunks: list[str] = []
     try:
-        with log_path.open("wb") as log_file:
-            process = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=os.environ.copy(),
-            )
-            while process.poll() is None:
-                if time.time() - started > timeout:
-                    process.kill()
-                    raise CliError("%s timed out" % label)
-                now = time.time()
-                if now - last_report >= (2 if sys.stderr.isatty() else 15):
-                    last_report = now
-                    if watch is not None and watch.exists():
-                        megabytes = watch.stat().st_size / (1024 * 1024)
-                        eprint(
-                            "%s: %.1f MB (%.0fs)"
-                            % (label, megabytes, now - started)
-                        )
-                    else:
-                        eprint("%s: %.0fs" % (label, now - started))
-                time.sleep(0.5)
-        output = log_path.read_text(encoding="utf-8", errors="replace")
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+        )
+        assert process.stdout is not None
+        while True:
+            if time.time() - started > timeout:
+                process.kill()
+                raise CliError("%s timed out" % label)
+            ready, _, _ = select.select([process.stdout], [], [], 0.1)
+            if ready:
+                chunk = process.stdout.read1(8192)  # type: ignore[attr-defined]
+                if chunk:
+                    output_chunks.append(chunk.decode("utf-8", "replace"))
+            now = time.time()
+            if now - last_report >= (2 if sys.stderr.isatty() else 15):
+                last_report = now
+                if watch is not None and watch.exists():
+                    megabytes = watch.stat().st_size / (1024 * 1024)
+                    eprint(
+                        "%s: %.1f MB (%.0fs)"
+                        % (label, megabytes, now - started)
+                    )
+                else:
+                    eprint("%s: %.0fs" % (label, now - started))
+            if process.poll() is not None:
+                # Drain remaining output after process exits.
+                remaining = process.stdout.read()
+                if remaining:
+                    output_chunks.append(remaining.decode("utf-8", "replace"))
+                break
+        output = "".join(output_chunks)
         return process.returncode, output
-    finally:
-        log_path.unlink(missing_ok=True)
+    except Exception:
+        raise
 
 
 def download_ipa(
@@ -1501,7 +1542,7 @@ def get_flow(
         )
         if full_output:
             artifact = encrypted_path(destination)
-            shutil.copyfile(str(ipa), str(artifact))
+            shutil.move(str(ipa), str(artifact))
             artifact.chmod(0o600)
     finally:
         shutil.rmtree(work, ignore_errors=True)
