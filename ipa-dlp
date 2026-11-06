@@ -1050,6 +1050,111 @@ def fetch_version_metadata(app_id: str, external_id: str) -> Optional[Dict[str, 
     }
 
 
+def _fetch_metadata_missing(
+    app_id: str,
+    ids: Sequence[str],
+    versions: Dict[str, Any],
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> None:
+    """Fetch metadata for the *ids* that are missing from *versions*.
+
+    Lookups run in a small thread pool so they overlap; *progress* is called
+    with ``(done, total)`` after each one completes.
+    """
+    missing = [ext for ext in ids if ext not in versions]
+    if not missing:
+        return
+    total = len(missing)
+    done = 0
+
+    def fetch(ext: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        try:
+            return ext, fetch_version_metadata(app_id, ext)
+        except Exception:
+            return ext, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+        for ext, metadata in pool.map(fetch, missing):
+            if metadata:
+                versions[ext] = metadata
+            done += 1
+            if progress is not None:
+                progress(done, total)
+
+
+def _release_date(value: Any) -> str:
+    """Render an App Store release timestamp as a plain date."""
+    text = str(value or "").strip()
+    match = re.match(r"(\d{4}-\d{2}-\d{2})", text)
+    return match.group(1) if match else (text or "-")
+
+
+def render_versions_table(rows: Sequence[Dict[str, str]]) -> None:
+    """Print an aligned EXT_ID / VERSION / RELEASED table to stdout."""
+    headers = ("EXT_ID", "VERSION", "RELEASED")
+    width_id = max([len(headers[0])] + [len(row["external_id"]) for row in rows])
+    width_version = max([len(headers[1])] + [len(row["version"]) for row in rows])
+    print(
+        "%-*s  %-*s  %s"
+        % (width_id, headers[0], width_version, headers[1], headers[2])
+    )
+    for row in rows:
+        print(
+            "%-*s  %-*s  %s"
+            % (
+                width_id,
+                row["external_id"],
+                width_version,
+                row["version"],
+                row["released"],
+            )
+        )
+
+
+def list_versions_table(app_id: str, limit: int = 30) -> List[Dict[str, str]]:
+    """Fetch and print the newest *limit* versions of *app_id*.
+
+    Metadata for versions that are not in the local cache is fetched in
+    parallel with a single-line progress status.
+    """
+    if limit < 1:
+        raise CliError("--limit must be at least 1")
+    ids = list_external_versions(app_id)[:limit]
+    if not ids:
+        raise CliError("App Store returned no versions for app %s" % app_id)
+
+    cache = load_version_cache(app_id)
+    versions: Dict[str, Any] = cache["versions"]
+    pending = [ext for ext in ids if ext not in versions]
+    if pending:
+        def progress(done: int, total: int) -> None:
+            _progress_line(
+                "Fetching metadata: %d/%d" % (done, total),
+                tag="versions",
+            )
+
+        try:
+            _fetch_metadata_missing(app_id, ids, versions, progress)
+        finally:
+            _finish_progress()
+        save_version_cache(app_id, cache)
+
+    rows: List[Dict[str, str]] = []
+    for ext in ids:
+        metadata = versions.get(ext)
+        if not isinstance(metadata, dict):
+            metadata = {}
+        rows.append(
+            {
+                "external_id": ext,
+                "version": str(metadata.get("displayVersion") or "-"),
+                "released": _release_date(metadata.get("releaseDate")),
+            }
+        )
+    render_versions_table(rows)
+    return rows
+
+
 def resolve_version(
     app_id: str,
     wanted: str,
@@ -1078,20 +1183,11 @@ def resolve_version(
 
     chunk_size = 20
 
-    def fetch(ext: str) -> Tuple[str, Optional[Dict[str, Any]]]:
-        try:
-            return ext, fetch_version_metadata(app_id, ext)
-        except Exception:
-            return ext, None
-
     for offset in range(0, len(ids), chunk_size):
         chunk = ids[offset : offset + chunk_size]
         missing = [ext for ext in chunk if ext not in versions]
         if missing:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-                for ext, metadata in pool.map(fetch, missing):
-                    if metadata:
-                        versions[ext] = metadata
+            _fetch_metadata_missing(app_id, chunk, versions)
             save_version_cache(app_id, cache)
 
         for ext in chunk:
@@ -1628,6 +1724,8 @@ def get_flow(
     reveal: bool = False,
     purchase: bool = False,
     full_output: bool = False,
+    list_versions: bool = False,
+    limit: int = 30,
 ) -> Path:
     ensure_tools()
     ensure_auth()
@@ -1638,6 +1736,10 @@ def get_flow(
         "app: %s [%s] id=%s"
         % (app.get("name", "?"), app.get("bundleID", "?"), app_id)
     )
+
+    if list_versions:
+        list_versions_table(app_id, limit)
+        return Path("")
 
     external_id = external_version_id.strip()
     metadata: Dict[str, Any] = {}
@@ -1717,6 +1819,8 @@ def cmd_get(args: argparse.Namespace) -> int:
         reveal=args.reveal,
         purchase=args.purchase,
         full_output=args.full,
+        list_versions=args.list_versions,
+        limit=args.limit,
     )
     return 0
 
@@ -1872,6 +1976,19 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--version", help="exact app version, e.g. 9.1.88")
     get.add_argument("--external-version-id", help="skip version lookup with an App Store external version ID")
     get.add_argument("-o", "--output", help="output IPA path")
+    get.add_argument(
+        "-F",
+        "--list-versions",
+        action="store_true",
+        help="list available App Store versions and exit",
+    )
+    get.add_argument(
+        "--limit",
+        type=int,
+        default=30,
+        metavar="N",
+        help="number of versions to show with --list-versions (default: 30)",
+    )
     get.add_argument("--platform", default=DEFAULT_PLATFORM)
     get.add_argument(
         "--keep-account-data",

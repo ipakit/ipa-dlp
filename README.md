@@ -146,6 +146,29 @@ metadata, newest versions first, and caches the mapping in
 resolve. If the App Store will not serve a version to your account, you get an
 error; `--external-version-id` lets you bypass the lookup once you know the ID.
 
+### Version history
+
+`--list-versions` (`-F`) prints the App Store's version history for an app,
+newest first, without downloading anything:
+
+```sh
+ipa-dlp get spotify --list-versions        # newest 30
+ipa-dlp get spotify -F --limit 100         # newest 100
+```
+
+The table goes to stdout:
+
+```text
+EXT_ID     VERSION  RELEASED
+871294812  9.1.88   2026-03-14
+870912300  9.1.86   2026-03-07
+```
+
+Metadata for versions that were not resolved before is fetched in parallel and
+stored in the same version cache used by `--version`, so later runs are
+instant. Pipe an `EXT_ID` into `--external-version-id` to download a version
+that is no longer listed.
+
 ### Licenses and paid apps
 
 Free apps are licensed automatically when needed. For a paid app, buy it in the
