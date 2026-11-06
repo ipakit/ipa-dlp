@@ -253,9 +253,11 @@ ipa-dlp setup --seed spotify --version 9.1.88
 `--version` matches the IPA's `CFBundleShortVersionString`. ipa-dlp
 maps it to Apple's external version identifier by asking the App Store for
 metadata, newest versions first, and caches the mapping in
-`~/Library/Caches/ipa-dlp/versions/`. Very old versions can take longer to
-resolve. If the App Store will not serve a version to your account, you get an
-error; `--external-version-id` lets you bypass the lookup once you know the ID.
+`~/Library/Caches/ipa-dlp/versions/`. ipa-dlp binary-searches the
+chronologically ordered version IDs, so even very old versions resolve in a
+handful of metadata requests. If the App Store will not serve a version to
+your account, you get an error; `--external-version-id` lets you bypass the
+lookup once you know the ID.
 
 ### Version history
 
@@ -263,7 +265,7 @@ error; `--external-version-id` lets you bypass the lookup once you know the ID.
 newest first, without downloading anything:
 
 ```sh
-ipa-dlp get spotify --list-versions        # newest 30
+ipa-dlp get spotify --list-versions        # newest 15
 ipa-dlp get spotify -F --limit 100         # newest 100
 ```
 

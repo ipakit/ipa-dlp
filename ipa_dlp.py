@@ -1049,7 +1049,7 @@ def _fetch_metadata_missing(
         except Exception:
             return ext, None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         for ext, metadata in pool.map(fetch, missing):
             if metadata:
                 versions[ext] = metadata
@@ -1089,7 +1089,7 @@ def render_versions_table(rows: Sequence[Dict[str, str]]) -> None:
 
 def list_versions_table(
     app_id: str,
-    limit: int = 30,
+    limit: int = 15,
     render: bool = True,
 ) -> List[Dict[str, str]]:
     """Fetch the newest *limit* versions of *app_id*.
@@ -1137,12 +1137,53 @@ def list_versions_table(
     return rows
 
 
+def _version_compare(left: str, right: str) -> int:
+    """Compare display versions by their numeric components.
+
+    Display versions are chronological strings such as ``9.1.88``. Comparing
+    the integer runs keeps ``9.1.88`` newer than ``9.1.9``; strings without
+    numbers fall back to a case-insensitive text comparison.
+    """
+    left_numbers = tuple(int(part) for part in re.findall(r"\d+", left))
+    right_numbers = tuple(int(part) for part in re.findall(r"\d+", right))
+    if left_numbers and right_numbers and left_numbers != right_numbers:
+        return (left_numbers > right_numbers) - (left_numbers < right_numbers)
+    left_text = left.strip().lower()
+    right_text = right.strip().lower()
+    return (left_text > right_text) - (left_text < right_text)
+
+
+def _cached_version_metadata(
+    app_id: str,
+    ext: str,
+    versions: Dict[str, Any],
+    cache: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Return (metadata, fetched) for one external version ID."""
+    metadata = versions.get(ext)
+    if isinstance(metadata, dict) and metadata.get("displayVersion"):
+        return metadata, False
+    try:
+        metadata = fetch_version_metadata(app_id, ext)
+    except Exception:
+        metadata = None
+    if metadata:
+        versions[ext] = metadata
+        save_version_cache(app_id, cache)
+    return metadata, True
+
+
 def resolve_version(
     app_id: str,
     wanted: str,
     refresh: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Return (external version id, metadata) for an exact display version."""
+    """Return (external version id, metadata) for an exact display version.
+
+    External version IDs are ordered newest-first and their display versions
+    decrease monotonically, so the lookup binary-searches the list instead of
+    probing every entry. A version among 500 IDs takes about nine requests.
+    """
     wanted = wanted.strip()
     if wanted[:1].lower() == "v" and wanted[1:2].isdigit():
         wanted = wanted[1:]
@@ -1163,35 +1204,59 @@ def resolve_version(
     if not ids:
         raise CliError("App Store returned no versions for app %s" % app_id)
 
-    chunk_size = 20
-
-    for offset in range(0, len(ids), chunk_size):
-        chunk = ids[offset : offset + chunk_size]
-        missing = [ext for ext in chunk if ext not in versions]
-        if missing:
-            _fetch_metadata_missing(app_id, chunk, versions)
-            save_version_cache(app_id, cache)
-
-        for ext in chunk:
-            metadata = versions.get(ext)
-            if metadata and str(metadata.get("displayVersion")) == wanted:
-                _finish_progress()
+    probes = 0
+    low, high = 0, len(ids) - 1
+    try:
+        while low <= high:
+            mid = (low + high) // 2
+            ext = ids[mid]
+            metadata, fetched = _cached_version_metadata(
+                app_id, ext, versions, cache
+            )
+            if fetched:
+                probes += 1
+                _progress_line(
+                    "Checking metadata: probe %d" % probes,
+                    tag="versions",
+                )
+            if metadata is None:
+                # A failed response hides the ordering; scan the remaining
+                # window rather than silently missing a match.
+                for index in range(low, high + 1):
+                    if index == mid:
+                        continue
+                    ext = ids[index]
+                    metadata, fetched = _cached_version_metadata(
+                        app_id, ext, versions, cache
+                    )
+                    if fetched:
+                        probes += 1
+                    if metadata and (
+                        str(metadata.get("displayVersion")) == wanted
+                    ):
+                        return ext, metadata
+                break
+            display = str(metadata.get("displayVersion") or "")
+            if display == wanted:
                 return ext, metadata
+            if _version_compare(display, wanted) > 0:
+                # The probe is newer than the target, so the target is older
+                # (further down the newest-first list).
+                low = mid + 1
+            else:
+                # The probe is older than the target, so search newer.
+                high = mid - 1
+    finally:
+        _finish_progress()
 
-        done = min(offset + chunk_size, len(ids))
-        _progress_line(
-            "Checking metadata: %d/%d" % (done, len(ids)),
-            tag="versions",
-        )
-
-    _finish_progress()
+    latest, _ = _cached_version_metadata(app_id, ids[0], versions, cache)
     raise CliError(
         "version %s was not found for app %s (latest available: %s); "
         "you can pass --external-version-id directly"
         % (
             wanted,
             app_id,
-            versions.get(ids[0], {}).get("displayVersion", "unknown"),
+            (latest or {}).get("displayVersion", "unknown"),
         )
     )
 
@@ -2072,7 +2137,7 @@ def _get_result(
     purchase: bool = False,
     full_output: bool = False,
     list_versions: bool = False,
-    limit: int = 30,
+    limit: int = 15,
     extract_binary: bool = False,
     exec_hook: str = "",
 ) -> Dict[str, Any]:
@@ -2662,9 +2727,9 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument(
         "--limit",
         type=int,
-        default=30,
+        default=15,
         metavar="N",
-        help="number of versions to show with --list-versions (default: 30)",
+        help="number of versions to show with --list-versions (default: 15)",
     )
     get.add_argument(
         "--extract-binary",
