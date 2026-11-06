@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+._*
+
+# ipa-dlp artifacts: downloaded/decrypted IPAs and decrypt reports are
+# personalized to the Apple ID that fetched them. Never commit them.
+*.ipa
+*.decrypted.ipa
+*.encrypted.ipa
+*.report.json
+models/
+*.fairplay
+
+# Editors
+.vscode/
+.idea/
+*.swp
