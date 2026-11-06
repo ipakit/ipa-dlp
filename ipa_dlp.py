@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""ipa-dlp - fetch and decrypt personalized App Store IPAs.
+"""ipa-dlp - fetch, decrypt, and extract App Store IPAs and Mach-O binaries.
 
-A small wrapper around ipatool and UnfairPlay:
-  * installs pinned ipatool / UnfairPlay binaries under your home directory
-  * authenticates through native macOS dialogs (including 2FA)
-  * downloads an app (optionally a specific version)
-  * recovers the FairPlay enrollment model once, using one admin prompt
-  * decrypts and verifies the IPA
+Python API:
+    from ipa_dlp import download, decrypt, extract_binary, load_macho
+
+    ipa = download("spotify", version="9.1.88")          # -> Path (.ipa)
+    bin_path = extract_binary(ipa)                       # -> Path (arm64 .bin)
+    blob = load_macho("spotify", version="9.1.88")       # -> bytes (arm64 Mach-O)
+
+CLI:
+    ipa-dlp get spotify --version 9.1.88 --extract-binary
+    ipa-dlp extract ./Spotify.ipa -o Spotify.bin
 
 Only use this with apps and accounts you lawfully control.
 """
@@ -36,6 +40,15 @@ import tty
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
+__all__ = [
+    "download",
+    "decrypt",
+    "extract_binary",
+    "load_macho",
+    "list_versions_table",
+    "CliError",
+]
 
 APP = "ipa-dlp"
 VERSION = "0.3.0"
