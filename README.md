@@ -126,6 +126,26 @@ Spotify-9.1.88.report.json
 For `ipa-dlp decrypt`, `--full` keeps the report; the encrypted input
 already exists where you put it.
 
+### Extracting the executable
+
+`--extract-binary` also writes the app's arm64 Mach-O executable next to the
+decrypted IPA, ready for a disassembler or symbol dumper:
+
+```sh
+ipa-dlp get spotify --version 9.1.88 --extract-binary
+ipa-dlp decrypt /path/to/App.ipa --extract-binary
+```
+
+```text
+~/Downloads/Spotify-9.1.88.ipa
+~/Downloads/Spotify-9.1.88.bin
+```
+
+The slice is read from the decrypted archive, so it is already FairPlay-free.
+Universal ("fat") executables are reduced to the arm64 slice (falling back to
+x86_64), written with mode `0755`, and the `.bin` path is what gets printed on
+stdout. The IPA is still written; pass `--force` to replace an existing `.bin`.
+
 Other commands:
 
 ```sh

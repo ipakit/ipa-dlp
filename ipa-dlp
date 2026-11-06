@@ -1408,6 +1408,96 @@ def extract_app(ipa: Path) -> Tuple[Path, Path]:
 
 
 # ---------------------------------------------------------------------------
+# Mach-O slicing
+# ---------------------------------------------------------------------------
+
+# On-disk Mach-O magics.
+MH_MAGIC = b"\xce\xfa\xed\xfe"        # 32-bit
+MH_MAGIC_64 = b"\xcf\xfa\xed\xfe"     # 64-bit
+MH_CIGAM = b"\xfe\xed\xfa\xce"
+MH_CIGAM_64 = b"\xfe\xed\xfa\xcf"
+FAT_MAGIC = b"\xca\xfe\xba\xbe"       # fat header, big-endian fields
+FAT_MAGIC_64 = b"\xca\xfe\xba\xbf"    # fat header, 64-bit offsets
+FAT_CIGAM = b"\xbe\xba\xfe\xca"
+FAT_CIGAM_64 = b"\xbf\xba\xfe\xca"
+CPU_TYPE_X86_64 = 0x01000007
+CPU_TYPE_ARM64 = 0x0100000C
+
+FAT_HEADER_SIZE = 8
+FAT_ENTRY_SIZE = 20
+FAT_ENTRY_SIZE_64 = 32
+
+
+def _uint(blob: bytes, offset: int, width: int, big_endian: bool) -> int:
+    return int.from_bytes(
+        blob[offset : offset + width],
+        "big" if big_endian else "little",
+    )
+
+
+def macho_slice(blob: bytes) -> Tuple[int, int]:
+    """Return (offset, size) of the arm64 (or first 64-bit) Mach-O slice."""
+    magic = blob[:4]
+    if magic in (MH_MAGIC, MH_MAGIC_64, MH_CIGAM, MH_CIGAM_64):
+        return 0, len(blob)
+
+    if magic in (FAT_MAGIC, FAT_MAGIC_64):
+        big_endian = True
+    elif magic in (FAT_CIGAM, FAT_CIGAM_64):
+        big_endian = False
+    else:
+        raise CliError(
+            "not a Mach-O binary (magic %s); is the IPA decrypted?" % magic.hex()
+        )
+
+    wide = magic in (FAT_MAGIC_64, FAT_CIGAM_64)
+    entry_size = FAT_ENTRY_SIZE_64 if wide else FAT_ENTRY_SIZE
+    count = _uint(blob, 4, 4, big_endian)
+    fallback: Optional[Tuple[int, int]] = None
+    for index in range(count):
+        base = FAT_HEADER_SIZE + index * entry_size
+        if base + entry_size > len(blob):
+            raise CliError("truncated fat Mach-O header")
+        cpu = _uint(blob, base, 4, big_endian)
+        if wide:
+            offset = _uint(blob, base + 8, 8, big_endian)
+            size = _uint(blob, base + 16, 8, big_endian)
+        else:
+            offset = _uint(blob, base + 8, 4, big_endian)
+            size = _uint(blob, base + 12, 4, big_endian)
+        if size <= 0 or offset + size > len(blob):
+            continue
+        if cpu == CPU_TYPE_ARM64:
+            return offset, size
+        if cpu == CPU_TYPE_X86_64 and fallback is None:
+            fallback = (offset, size)
+    if fallback is not None:
+        return fallback
+    raise CliError("no arm64 or x86_64 slice in fat Mach-O binary")
+
+
+def extract_macho_binary(ipa: Path, info: Dict[str, Any], dest: Path) -> Path:
+    """Write the arm64 executable slice from the decrypted *ipa* to *dest*."""
+    member = "%s/%s" % (info.get("root", ""), info.get("executable", ""))
+    try:
+        archive = zipfile.ZipFile(str(ipa))
+    except Exception as exc:
+        raise CliError("not a readable IPA: %s" % ipa) from exc
+    with archive:
+        try:
+            blob = archive.read(member)
+        except KeyError as exc:
+            raise CliError("IPA has no executable at %s" % member) from exc
+    offset, size = macho_slice(blob)
+    dest = dest.expanduser()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as handle:
+        handle.write(blob[offset : offset + size])
+    dest.chmod(0o755)
+    return dest
+
+
+# ---------------------------------------------------------------------------
 # FairPlay model and decryption
 # ---------------------------------------------------------------------------
 
@@ -1529,6 +1619,11 @@ def report_path(output: Path) -> Path:
 def encrypted_path(output: Path) -> Path:
     base = output_base(output)
     return base.parent / (base.name + ".encrypted.ipa")
+
+
+def binary_path(output: Path) -> Path:
+    base = output_base(output)
+    return base.parent / (base.name + ".bin")
 
 
 def verify_stripped_ipa(path: Path) -> None:
@@ -1726,6 +1821,7 @@ def get_flow(
     full_output: bool = False,
     list_versions: bool = False,
     limit: int = 30,
+    extract_binary: bool = False,
 ) -> Path:
     ensure_tools()
     ensure_auth()
@@ -1769,11 +1865,16 @@ def get_flow(
                 % (info.get("version"), version)
             )
         destination = Path(output).expanduser() if output else default_output(info)
+        binary_dest = binary_path(destination) if extract_binary else None
+        if binary_dest is not None and binary_dest.exists() and not force:
+            raise CliError(
+                "binary already exists (use --force): %s" % binary_dest
+            )
         if full_output:
-            artifact = encrypted_path(destination)
-            if artifact.exists() and not force:
+            encrypted = encrypted_path(destination)
+            if encrypted.exists() and not force:
                 raise CliError(
-                    "encrypted IPA already exists (use --force): %s" % artifact
+                    "encrypted IPA already exists (use --force): %s" % encrypted
                 )
         report = decrypt_ipa(
             ipa,
@@ -1784,14 +1885,19 @@ def get_flow(
             full_output=full_output,
         )
         if full_output:
-            artifact = encrypted_path(destination)
-            shutil.move(str(ipa), str(artifact))
-            artifact.chmod(0o600)
+            encrypted = encrypted_path(destination)
+            shutil.move(str(ipa), str(encrypted))
+            encrypted.chmod(0o600)
+        if binary_dest is not None:
+            extract_macho_binary(destination, info, binary_dest)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
-    print(str(destination))
+    artifact = binary_dest if binary_dest is not None else destination
+    print(str(artifact))
     eprint("decrypted IPA: %s" % destination)
+    if binary_dest is not None:
+        eprint("binary: %s" % binary_dest)
     eprint("verified: %s" % ("yes" if report.get("PlaintextVerified") else "no"))
     if keep_account_data:
         eprint("account data stripped: no (kept by request)")
@@ -1802,7 +1908,7 @@ def get_flow(
         eprint("report: %s" % report_path(destination))
     eprint("done.")
     if reveal:
-        subprocess.run(["open", "-R", str(destination)], check=False)
+        subprocess.run(["open", "-R", str(artifact)], check=False)
     return destination
 
 
@@ -1821,6 +1927,7 @@ def cmd_get(args: argparse.Namespace) -> int:
         full_output=args.full,
         list_versions=args.list_versions,
         limit=args.limit,
+        extract_binary=args.extract_binary,
     )
     return 0
 
@@ -1834,6 +1941,9 @@ def cmd_decrypt(args: argparse.Namespace) -> int:
     destination = (
         Path(args.output).expanduser() if args.output else default_output(info)
     )
+    binary_dest = binary_path(destination) if args.extract_binary else None
+    if binary_dest is not None and binary_dest.exists() and not args.force:
+        raise CliError("binary already exists (use --force): %s" % binary_dest)
     report = decrypt_ipa(
         ipa,
         info,
@@ -1842,8 +1952,13 @@ def cmd_decrypt(args: argparse.Namespace) -> int:
         force=args.force,
         full_output=args.full,
     )
-    print(str(destination))
+    if binary_dest is not None:
+        extract_macho_binary(destination, info, binary_dest)
+    artifact = binary_dest if binary_dest is not None else destination
+    print(str(artifact))
     eprint("decrypted IPA: %s" % destination)
+    if binary_dest is not None:
+        eprint("binary: %s" % binary_dest)
     eprint("verified: %s" % ("yes" if report.get("PlaintextVerified") else "no"))
     if args.keep_account_data:
         eprint("account data stripped: no (kept by request)")
@@ -1853,7 +1968,7 @@ def cmd_decrypt(args: argparse.Namespace) -> int:
         eprint("report: %s" % report_path(destination))
     eprint("done.")
     if args.reveal:
-        subprocess.run(["open", "-R", str(destination)], check=False)
+        subprocess.run(["open", "-R", str(artifact)], check=False)
     return 0
 
 
@@ -1989,6 +2104,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="number of versions to show with --list-versions (default: 30)",
     )
+    get.add_argument(
+        "--extract-binary",
+        action="store_true",
+        help="also extract the arm64 Mach-O executable to <output>.bin",
+    )
     get.add_argument("--platform", default=DEFAULT_PLATFORM)
     get.add_argument(
         "--keep-account-data",
@@ -2024,6 +2144,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--full",
         action="store_true",
         help="keep the decryption report next to the output",
+    )
+    decrypt.add_argument(
+        "--extract-binary",
+        action="store_true",
+        help="also extract the arm64 Mach-O executable to <output>.bin",
     )
     decrypt.add_argument("--force", action="store_true")
     decrypt.add_argument("--reveal", action="store_true")
