@@ -25,7 +25,6 @@ import json
 import os
 import platform
 import plistlib
-import pty
 import re
 import select
 import shutil
@@ -33,13 +32,22 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import termios
 import threading
 import time
-import tty
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+
+try:
+    import pty
+    import termios
+    import tty
+except ImportError:  # Windows has no POSIX terminal modules.
+    pty = None
+    termios = None
+    tty = None
+
+HAS_PTY = pty is not None and termios is not None and tty is not None
 
 __all__ = [
     "download",
@@ -53,7 +61,14 @@ __all__ = [
 APP = "ipa-dlp"
 VERSION = "0.3.0"
 IPATOOL_VERSION = "2.7.0"
-IPATOOL_SHA256 = "5ae100d4520cf4b3f4374239e5925a9ad9a8dc02abc16bae27479e7ae99aca33"
+IPATOOL_SHA256 = {
+    "ipatool-2.7.0-macos-arm64.tar.gz": "5ae100d4520cf4b3f4374239e5925a9ad9a8dc02abc16bae27479e7ae99aca33",
+    "ipatool-2.7.0-macos-amd64.tar.gz": "05f48994d8b3cfefe7ea1172a0ac0b28715888e9df0af38cf3e490d2ed592263",
+    "ipatool-2.7.0-linux-amd64.tar.gz": "68372de9743d468296f2dba5b413a3e7df56ad0c85b8d0f4f0f6c9b8b53a54e8",
+    "ipatool-2.7.0-linux-arm64.tar.gz": "133c3fb754bafcd61698ba6047b48096c7033345529f57d7a83d281f8a403c23",
+    "ipatool-2.7.0-windows-amd64.tar.gz": "b729608716908be287c2e6972f9e8cd05f879810ae5d182fc856c9e57cca0dd5",
+    "ipatool-2.7.0-windows-arm64.tar.gz": "85ab35a268b47e1729412178063fe11621cae1135f33d3b9ab5233d436bf2562",
+}
 UNFAIRPLAY_VERSION = "0.2.0"
 UNFAIRPLAY_SHA256 = "e37d230c771fff884c4055a006645d0756c8d9d0c52bfd7f1d02df8fd71cb052"
 
@@ -411,8 +426,8 @@ def choose_item(title: str, prompt: str, items: List[str]) -> str:
         except CliError:
             pass
 
-    # Arrow-key selector when stdin is a TTY.
-    if sys.stdin.isatty():
+    # Arrow-key selector when the platform and stdin support it.
+    if HAS_PTY and sys.stdin.isatty():
         return _arrow_select(prompt, items)
 
     # Dumb fallback for pipes / non-TTY.
@@ -510,7 +525,10 @@ def _arrow_select(prompt: str, items: List[str]) -> str:
 
 def ipatool_path() -> Path:
     override = os.environ.get("IPADLP_IPATOOL")
-    return Path(override).expanduser() if override else BIN_DIR / "ipatool"
+    if override:
+        return Path(override).expanduser()
+    name = "ipatool.exe" if os.name == "nt" else "ipatool"
+    return BIN_DIR / name
 
 
 def unfairplay_path() -> Path:
@@ -599,8 +617,13 @@ def extract_tar(archive: Path) -> Path:
 
 
 def find_binary(root: Path, name: str) -> Path:
-    for candidate in root.rglob(name):
-        if candidate.is_file() and not candidate.is_symlink():
+    wanted = {name, name + ".exe"}
+    for candidate in root.rglob("*"):
+        if (
+            candidate.is_file()
+            and not candidate.is_symlink()
+            and candidate.name in wanted
+        ):
             return candidate
     prefixed = [
         candidate
@@ -619,10 +642,13 @@ def install_binary(source: Path, destination: Path) -> None:
 
 
 def install_ipatool() -> None:
-    name = "ipatool-%s-macos-arm64.tar.gz" % IPATOOL_VERSION
+    name = _ipatool_asset_name()
+    checksum = IPATOOL_SHA256.get(name)
+    if not checksum:
+        raise CliError("no pinned checksum for ipatool asset %s" % name)
     base = "https://github.com/majd/ipatool/releases/download/v%s" % IPATOOL_VERSION
     archive = CACHE_DIR / "downloads" / name
-    download_file(base + "/" + name, archive, IPATOOL_SHA256)
+    download_file(base + "/" + name, archive, checksum)
     root = extract_tar(archive)
     try:
         install_binary(find_binary(root, "ipatool"), ipatool_path())
@@ -660,17 +686,45 @@ def _tool_ready(path: Path) -> bool:
     return path.is_file() and os.access(str(path), os.X_OK)
 
 
-def ensure_tools(update: bool = False) -> None:
-    if platform.system() != "Darwin":
-        raise CliError("this tool only supports macOS")
-    if platform.machine() != "arm64":
+def _host_arch(machine: Optional[str] = None) -> str:
+    value = (machine or platform.machine()).lower()
+    if value in ("arm64", "aarch64"):
+        return "arm64"
+    if value in ("x86_64", "amd64"):
+        return "amd64"
+    raise CliError("ipatool has no build for this architecture (%s)" % value)
+
+
+def _ipatool_asset_name(
+    system: Optional[str] = None,
+    machine: Optional[str] = None,
+) -> str:
+    system = system or platform.system()
+    names = {"Darwin": "macos", "Linux": "linux", "Windows": "windows"}
+    os_name = names.get(system)
+    if os_name is None:
         raise CliError(
-            "UnfairPlay requires an Apple Silicon Mac (found %s)" % platform.machine()
+            "ipatool is not available for %s; use macOS, Linux, or Windows"
+            % system
         )
+    return "ipatool-%s-%s-%s.tar.gz" % (
+        IPATOOL_VERSION,
+        os_name,
+        _host_arch(machine),
+    )
 
+
+def _decrypt_supported(
+    system: Optional[str] = None,
+    machine: Optional[str] = None,
+) -> bool:
+    system = system or platform.system()
+    machine = (machine or platform.machine()).lower()
+    return system == "Darwin" and machine == "arm64"
+
+
+def ensure_ipatool(update: bool = False) -> None:
     ipatool = ipatool_path()
-    unfairplay = unfairplay_path()
-
     if update or not _tool_ready(ipatool):
         if os.environ.get("IPADLP_IPATOOL"):
             raise CliError(
@@ -679,6 +733,11 @@ def ensure_tools(update: bool = False) -> None:
             )
         install_ipatool()
 
+
+def ensure_unfairplay(update: bool = False) -> None:
+    if not _decrypt_supported():
+        raise CliError("FairPlay decryption requires an Apple Silicon Mac")
+    unfairplay = unfairplay_path()
     if update or not _tool_ready(unfairplay):
         if os.environ.get("IPADLP_UNFAIRPLAY"):
             raise CliError(
@@ -797,6 +856,54 @@ def login_pty(
     return process.returncode, safe
 
 
+def login_flags(
+    email: str,
+    password: str,
+    code_prompt: Callable[[], str],
+) -> Tuple[int, str]:
+    """Sign in without a PTY using ipatool's --password/--auth-code flags."""
+    base = [
+        str(ipatool_path()),
+        "auth",
+        "login",
+        "--email",
+        email,
+        "--password",
+        password,
+        "--non-interactive",
+    ]
+    code = ""
+    completed: Optional[subprocess.CompletedProcess] = None
+    output = ""
+    for _ in range(2):
+        cmd = list(base)
+        if code:
+            cmd.extend(["--auth-code", code])
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CliError("login timed out") from exc
+        output = strip_ansi(
+            (completed.stdout or "") + "\n" + (completed.stderr or "")
+        ).replace(password, "[redacted]")
+        if completed.returncode == 0:
+            return 0, output
+        if code or not re.search(
+            r"(2fa|2.factor|two.factor|two-factor|auth(?:entication)? code|verification code)",
+            output,
+            re.IGNORECASE,
+        ):
+            return completed.returncode, output
+        code = code_prompt()
+    return (completed.returncode if completed else 1), output
+
+
 def ensure_auth(force: bool = False) -> Dict[str, Any]:
     if not force:
         info = auth_info()
@@ -827,7 +934,10 @@ def ensure_auth(force: bool = False) -> Dict[str, Any]:
     last_output = ""
     for attempt in range(1, 4):
         log("signing in to the App Store...", tag="ipatool")
-        code, output = login_pty(email, password, ask_code)
+        if HAS_PTY:
+            _, output = login_pty(email, password, ask_code)
+        else:
+            _, output = login_flags(email, password, ask_code)
         last_output = output
         info = auth_info()
         if info:
@@ -1401,16 +1511,23 @@ def _progress_text(
 
 
 def _watch_size(watch: Optional[Path]) -> Optional[int]:
-    """Return the current download size, falling back to ipatool's .tmp file."""
+    """Return the largest file size in the per-download temp directory.
+
+    ipatool may stream into any temporary filename and rename at the end, so
+    looking at every file in the dedicated download directory is more robust
+    than guessing a suffix.
+    """
     if watch is None:
         return None
-    for candidate in (watch, watch.with_name(watch.name + ".tmp")):
-        try:
-            if candidate.exists():
-                return candidate.stat().st_size
-        except OSError:
-            continue
-    return None
+    try:
+        sizes = [
+            candidate.stat().st_size
+            for candidate in watch.parent.iterdir()
+            if candidate.is_file()
+        ]
+    except OSError:
+        return None
+    return max(sizes, default=None)
 
 
 def run_with_progress(
@@ -1424,8 +1541,8 @@ def run_with_progress(
     """Run *argv* while streaming stdout/stderr and reporting progress.
 
     Both pipes are read line by line on reader threads, so tool output appears
-    immediately instead of only on failure. The output file (or ipatool's
-    ``.tmp`` streaming file) is watched for live bytes; a known *total_bytes*
+    immediately instead of only on failure. The download directory is watched
+    for live bytes; a known *total_bytes*
     or a percentage in the tool's output drives a single progress line with a
     bar, percentage, speed, and ETA. The line is cleared with
     ``\\r\\x1b[K`` before any streamed line is written.
@@ -1937,6 +2054,19 @@ def ensure_model(
     return final
 
 
+def reveal_path(path: Path) -> None:
+    """Reveal *path* in the host file manager, best effort."""
+    try:
+        if platform.system() == "Darwin":
+            subprocess.run(["open", "-R", str(path)], check=False)
+        elif os.name == "nt":
+            subprocess.run(["explorer", "/select,%s" % path], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path.parent)], check=False)
+    except (FileNotFoundError, OSError):
+        log("warning: could not reveal %s" % path)
+
+
 def default_output(info: Dict[str, Any]) -> Path:
     name = re.sub(r"[^0-9A-Za-z._ -]+", "", info.get("name", "")).strip()
     name = re.sub(r"\s+", "-", name) or info.get("bundle_id") or "App"
@@ -2142,11 +2272,18 @@ def decrypt_ipa(
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    ensure_tools(update=args.update)
+    if args.seed and not _decrypt_supported():
+        raise CliError(
+            "FairPlay decryption requires an Apple Silicon Mac; --seed needs "
+            "decryption"
+        )
+    ensure_ipatool(update=args.update)
     info = ensure_auth(force=args.reauth)
     log("account: %s" % (info.get("email") or info.get("name") or "unknown"))
+    decrypt_supported = _decrypt_supported()
 
     if args.seed:
+        ensure_unfairplay(update=args.update)
         log("warming the FairPlay model with %r" % args.seed)
         app = resolve_app(args.seed, args.platform)
         external_id = ""
@@ -2172,7 +2309,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
         finally:
             shutil.rmtree(work, ignore_errors=True)
         log("FairPlay model is ready")
-    else:
+    elif decrypt_supported:
+        ensure_unfairplay(update=args.update)
         state = doctor()
         if state and (
             state.get("decrypt_ready")
@@ -2184,11 +2322,20 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 "no FairPlay model yet; it will be created automatically on "
                 "the first `ipa-dlp get`, with one admin prompt"
             )
+    else:
+        log(
+            "FairPlay decryption is unavailable on this platform; "
+            "`ipa-dlp get --encrypted` still downloads raw IPAs"
+        )
 
     log("")
     log("Installed and authenticated. Try:")
-    log("  ipa-dlp get spotify")
-    log("  ipa-dlp get spotify --version 9.1.88")
+    if decrypt_supported:
+        log("  ipa-dlp get spotify")
+        log("  ipa-dlp get spotify --version 9.1.88")
+    else:
+        log("  ipa-dlp get spotify --encrypted")
+        log("  ipa-dlp get spotify -F")
     if JSON_OUTPUT:
         _emit_json(
             {
@@ -2197,7 +2344,10 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 "version": VERSION,
                 "account": (info or {}).get("email") or "unknown",
                 "ipatool_version": IPATOOL_VERSION,
-                "unfairplay_version": UNFAIRPLAY_VERSION,
+                "unfairplay_version": (
+                    UNFAIRPLAY_VERSION if decrypt_supported else None
+                ),
+                "decrypt_supported": decrypt_supported,
             }
         )
     return 0
@@ -2241,6 +2391,7 @@ def _get_result(
     limit: int = 15,
     extract_binary: bool = False,
     exec_hook: str = "",
+    encrypted: bool = False,
 ) -> Dict[str, Any]:
     """Run the get flow and return a structured result.
 
@@ -2248,7 +2399,24 @@ def _get_result(
     a JSON object, and the library API returns paths only.
     """
     query, version = _split_query_version(query, version)
-    ensure_tools()
+    if encrypted and extract_binary:
+        raise CliError(
+            "--extract-binary requires decryption and cannot be combined "
+            "with --encrypted"
+        )
+    if (
+        not list_versions
+        and not encrypted
+        and not dry_run
+        and not _decrypt_supported()
+    ):
+        raise CliError(
+            "FairPlay decryption requires an Apple Silicon Mac.\n"
+            "Use `ipa-dlp get %s --encrypted` to download the encrypted IPA, "
+            "or `ipa-dlp extract` on an already-decrypted IPA." % query
+        )
+
+    ensure_ipatool()
     ensure_auth()
 
     app = resolve_app(query, platform_name)
@@ -2291,6 +2459,9 @@ def _get_result(
             "binary": None,
         }
 
+    if not encrypted:
+        ensure_unfairplay()
+
     work = Path(tempfile.mkdtemp(prefix="ipa-dlp-get-"))
     try:
         ipa = work / "App.ipa"
@@ -2310,16 +2481,52 @@ def _get_result(
             if output
             else default_output(info)
         )
+
+        if encrypted:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if not force:
+                    raise CliError(
+                        "output already exists (use --force): %s" % destination
+                    )
+                destination.unlink()
+            shutil.move(str(ipa), str(destination))
+            destination.chmod(0o600)
+            log("encrypted IPA: %s" % destination)
+            log("not decrypted (--encrypted)")
+            log("done.")
+            if exec_hook:
+                run_exec_hook(exec_hook, destination, info, external_id)
+            if reveal:
+                reveal_path(destination)
+            return {
+                "ok": True,
+                "command": "get",
+                "query": query,
+                "app": _app_summary(app),
+                "external_id": external_id,
+                **_info_summary(info),
+                "artifact": str(destination),
+                "ipa": None,
+                "binary": None,
+                "encrypted": True,
+                "encrypted_ipa": str(destination),
+                "report": None,
+                "verified": False,
+                "account_data_stripped": False,
+            }
+
         binary_dest = binary_path(destination) if extract_binary else None
         if binary_dest is not None and binary_dest.exists() and not force:
             raise CliError(
                 "binary already exists (use --force): %s" % binary_dest
             )
         if full_output:
-            encrypted = encrypted_path(destination)
-            if encrypted.exists() and not force:
+            encrypted_path_ = encrypted_path(destination)
+            if encrypted_path_.exists() and not force:
                 raise CliError(
-                    "encrypted IPA already exists (use --force): %s" % encrypted
+                    "encrypted IPA already exists (use --force): %s"
+                    % encrypted_path_
                 )
         report = decrypt_ipa(
             ipa,
@@ -2330,9 +2537,9 @@ def _get_result(
             full_output=full_output,
         )
         if full_output:
-            encrypted = encrypted_path(destination)
-            shutil.move(str(ipa), str(encrypted))
-            encrypted.chmod(0o600)
+            encrypted_path_ = encrypted_path(destination)
+            shutil.move(str(ipa), str(encrypted_path_))
+            encrypted_path_.chmod(0o600)
         if binary_dest is not None:
             extract_macho_binary(destination, info, binary_dest)
     finally:
@@ -2349,6 +2556,7 @@ def _get_result(
         "artifact": str(artifact),
         "ipa": str(destination),
         "binary": str(binary_dest) if binary_dest is not None else None,
+        "encrypted": False,
         "encrypted_ipa": str(encrypted_path(destination)) if full_output else None,
         "report": str(report_path(destination)) if full_output else None,
         "verified": bool(report.get("PlaintextVerified")),
@@ -2369,7 +2577,7 @@ def _get_result(
     if exec_hook:
         run_exec_hook(exec_hook, artifact, info, external_id)
     if reveal:
-        subprocess.run(["open", "-R", str(artifact)], check=False)
+        reveal_path(artifact)
     return result
 
 
@@ -2396,6 +2604,7 @@ def cmd_get(args: argparse.Namespace) -> int:
         limit=args.limit,
         extract_binary=args.extract_binary,
         exec_hook=args.exec_cmd or "",
+        encrypted=args.encrypted,
     )
     if args.list_versions:
         if JSON_OUTPUT:
@@ -2421,7 +2630,8 @@ def _decrypt_result(
     reveal: bool = False,
 ) -> Dict[str, Any]:
     """Run the decrypt flow and return a structured result (stderr only)."""
-    ensure_tools()
+    ensure_unfairplay()
+    ensure_ipatool()
     ipa = Path(ipa).expanduser()
     if not ipa.exists():
         raise CliError("IPA not found: %s" % ipa)
@@ -2472,7 +2682,7 @@ def _decrypt_result(
     if exec_hook:
         run_exec_hook(exec_hook, artifact, info)
     if reveal:
-        subprocess.run(["open", "-R", str(artifact)], check=False)
+        reveal_path(artifact)
     return result
 
 
@@ -2509,9 +2719,13 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    ensure_tools()
+    ensure_ipatool()
     info = auth_info()
-    state = doctor()
+    decrypt_supported = _decrypt_supported()
+    state = None
+    if decrypt_supported:
+        ensure_unfairplay()
+        state = doctor()
     model_ready = bool(
         state
         and (
@@ -2519,14 +2733,19 @@ def cmd_status(args: argparse.Namespace) -> int:
             or (state.get("checks") or {}).get("model_valid")
         )
     )
+    unfairplay = str(unfairplay_path()) if decrypt_supported else None
+    unfairplay_version = (
+        tool_version(unfairplay_path()) if decrypt_supported else ""
+    )
     payload = {
         "ok": True,
         "command": "status",
         "version": VERSION,
         "ipatool": str(ipatool_path()),
         "ipatool_version": tool_version(ipatool_path()),
-        "unfairplay": str(unfairplay_path()),
-        "unfairplay_version": tool_version(unfairplay_path()),
+        "unfairplay": unfairplay,
+        "unfairplay_version": unfairplay_version,
+        "decrypt_supported": decrypt_supported,
         "account": (info or {}).get("email") or "not signed in",
         "models": str(MODEL_DIR),
         "model_ready": model_ready,
@@ -2538,16 +2757,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         return 0
     print("ipa-dlp %s" % VERSION)
     print("ipatool:    %s (%s)" % (payload["ipatool"], payload["ipatool_version"]))
-    print(
-        "unfairplay: %s (%s)"
-        % (payload["unfairplay"], payload["unfairplay_version"])
-    )
+    if unfairplay:
+        print("unfairplay: %s (%s)" % (unfairplay, unfairplay_version))
+    else:
+        print("unfairplay: unavailable (requires Apple Silicon Mac)")
     print("account:    %s" % payload["account"])
     print("models:     %s" % payload["models"])
-    print(
-        "decrypt:    %s"
-        % ("model ready" if model_ready else "setup on first get")
-    )
+    if not decrypt_supported:
+        print("decrypt:    unavailable on this platform")
+    else:
+        print(
+            "decrypt:    %s"
+            % ("model ready" if model_ready else "setup on first get")
+        )
     print("data:       %s" % payload["data"])
     print("cache:      %s" % payload["cache"])
     return 0
@@ -2573,8 +2795,9 @@ def download(
     exec_hook: str = "",
     dry_run: bool = False,
     reveal: bool = False,
+    encrypted: bool = False,
 ) -> Path:
-    """Download and decrypt *query*; return the final artifact path."""
+    """Download *query* (and decrypt unless *encrypted*); return the artifact."""
     result = _get_result(
         query,
         version or "",
@@ -2589,6 +2812,7 @@ def download(
         full_output=full_output,
         extract_binary=extract_binary,
         exec_hook=exec_hook,
+        encrypted=encrypted,
     )
     return Path(result["artifact"])
 
@@ -2636,7 +2860,8 @@ def _default_extract_output(target: Path) -> Path:
 
 def _decrypt_for_extract(ipa: Path, info: Dict[str, Any]) -> bytes:
     """Decrypt *ipa* into a temp directory and return its arm64 slice."""
-    ensure_tools()
+    ensure_unfairplay()
+    ensure_ipatool()
     work = Path(tempfile.mkdtemp(prefix="ipa-dlp-extract-"))
     try:
         decrypted = work / "App.ipa"
@@ -2807,6 +3032,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  ipa-dlp get spotify --version 9.1.88\n"
             "  ipa-dlp get spotify -v 9.1.88 --extract-binary\n"
             "  ipa-dlp get spotify -F --limit 15\n"
+            "  ipa-dlp get spotify --encrypted\n"
             "  ipa-dlp extract ./Spotify.ipa -o Spotify.bin\n"
             "  ipa-dlp get spotify -v 9.1.88 --json\n\n"
             "python api:\n"
@@ -2861,6 +3087,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--extract-binary",
         action="store_true",
         help="also extract the arm64 Mach-O executable to <output>.bin",
+    )
+    get.add_argument(
+        "--encrypted",
+        action="store_true",
+        help="download the FairPlay-encrypted IPA without decrypting",
     )
     get.add_argument(
         "--exec",
@@ -2963,7 +3194,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     USE_GUI = bool(getattr(args, "gui", False))
     VERBOSE = bool(getattr(args, "verbose", False))
     JSON_OUTPUT = bool(getattr(args, "json", False))
-    if os.geteuid() == 0:
+    if getattr(os, "geteuid", lambda: 1)() == 0:
         message = (
             "run ipa-dlp as your normal user; it asks for admin only when needed"
         )
