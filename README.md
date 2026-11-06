@@ -259,6 +259,10 @@ handful of metadata requests. If the App Store will not serve a version to
 your account, you get an error; `--external-version-id` lets you bypass the
 lookup once you know the ID.
 
+The version can be given as `--version 9.1.88` (or `-v`), as a second
+positional (`ipa-dlp get spotify 9.1.88`), or appended to the query
+(`ipa-dlp get spotify@9.1.88`). The `@` form also works with `load_macho`.
+
 ### Version history
 
 `--list-versions` (`-F`) prints the App Store's version history for an app,

@@ -980,6 +980,13 @@ def resolve_app(query: str, platform_name: str = DEFAULT_PLATFORM) -> Dict[str, 
     return apps[labels.index(selected)]
 
 
+def _split_query_version(query: str, version: str) -> Tuple[str, str]:
+    """Split a trailing ``@version`` off *query* when no version was given."""
+    if "@" in query and not version:
+        query, version = query.rsplit("@", 1)
+    return query.strip(), version.strip()
+
+
 def version_cache_path(app_id: str) -> Path:
     safe = re.sub(r"[^0-9A-Za-z_.-]", "_", app_id)
     return CACHE_DIR / "versions" / (safe + ".json")
@@ -2159,6 +2166,7 @@ def _get_result(
     Nothing is written to stdout here: the CLI decides between a plain path and
     a JSON object, and the library API returns paths only.
     """
+    query, version = _split_query_version(query, version)
     ensure_tools()
     ensure_auth()
 
@@ -2285,9 +2293,15 @@ def _get_result(
 
 
 def cmd_get(args: argparse.Namespace) -> int:
+    if args.version and args.pos_version and args.version != args.pos_version:
+        raise CliError(
+            "conflicting versions: --version %s and positional %s"
+            % (args.version, args.pos_version)
+        )
+    version = args.version or args.pos_version or ""
     result = _get_result(
         args.query,
-        args.version or "",
+        version,
         args.output,
         keep_account_data=args.keep_account_data,
         force=args.force,
@@ -2654,6 +2668,9 @@ def load_macho(
     version: Optional[str] = None,
 ) -> bytes:
     """Return arm64 Mach-O bytes for a local path or an App Store query."""
+    path_or_query, version = _split_query_version(
+        str(path_or_query), version or ""
+    )
     target = Path(path_or_query).expanduser()
     if target.exists():
         data, encrypted, decrypted, _ = _target_macho_bytes(target)
@@ -2663,7 +2680,7 @@ def load_macho(
     with tempfile.TemporaryDirectory(prefix="ipa-dlp-macho-") as work:
         ipa = download(
             str(path_or_query),
-            version=version,
+            version=version or None,
             output=str(Path(work) / "App.ipa"),
             force=True,
         )
@@ -2715,7 +2732,9 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--update", action="store_true", help="reinstall pinned tools")
     setup.add_argument("--reauth", action="store_true", help="force a new login")
     setup.add_argument("--seed", help="optional app to warm the FairPlay model now")
-    setup.add_argument("--version", dest="version", help="version for --seed")
+    setup.add_argument(
+        "-v", "--version", dest="version", help="version for --seed"
+    )
     setup.add_argument(
         "--purchase",
         action="store_true",
@@ -2728,7 +2747,8 @@ def build_parser() -> argparse.ArgumentParser:
         "get", help="download and decrypt an app", parents=[common]
     )
     get.add_argument("query", help="app name, bundle ID, or App Store ID")
-    get.add_argument("--version", help="exact app version, e.g. 9.1.88")
+    get.add_argument("pos_version", nargs="?", help=argparse.SUPPRESS)
+    get.add_argument("-v", "--version", help="exact app version, e.g. 9.1.88")
     get.add_argument("--external-version-id", help="skip version lookup with an App Store external version ID")
     get.add_argument("-o", "--output", help="output IPA path")
     get.add_argument(
