@@ -1,7 +1,7 @@
 # ipa-dlp
 
-A macOS CLI and Python library for fetching, decrypting, and extracting App
-Store IPAs and Mach-O binaries (powered by
+A cross-platform CLI and Python library for fetching, decrypting, and
+extracting App Store IPAs and Mach-O binaries (powered by
 [ipatool](https://github.com/majd/ipatool) and
 [UnfairPlay](https://github.com/DrWhax/unfairplay)). It turns this:
 
@@ -19,21 +19,37 @@ ipa-dlp get spotify@9.1.88
 ```
 
 It prompts for your Apple ID in the terminal (including 2FA) by default;
-`--gui` switches to native macOS dialogs. It installs pinned copies of both
-tools under your home directory, recovers the reusable FairPlay model on first
-use with one admin prompt, downloads the requested app version, decrypts it,
+`--gui` switches to native macOS dialogs. On an Apple Silicon Mac it installs
+pinned copies of both tools, recovers the reusable FairPlay model on first use
+with one admin prompt, downloads the requested app version, decrypts it,
 strips the App Store account data, and verifies the plaintext before reporting
-success.
+success. On macOS Intel, Linux, and Windows, search, version history,
+`get --encrypted`, and local extraction work; FairPlay decryption requires an
+Apple Silicon Mac.
 
 ## Requirements
 
-- Apple Silicon Mac (UnfairPlay's FairPlay recovery is arm64-only)
-- Python 3.9+ (`/usr/bin/python3` from Xcode Command Line Tools is enough)
-- Admin rights for the one-time model recovery
+- Python 3.9+
+- macOS, Linux, or Windows for search, `get -F`, `get --encrypted`, and local
+  extraction (`ipatool` is downloaded automatically for your platform)
+- An Apple Silicon Mac for FairPlay decryption (`get` without `--encrypted`,
+  `decrypt`, `setup --seed`), plus admin rights for the one-time model recovery
+
+## Platform support
+
+| Capability | macOS arm64 | macOS Intel | Linux | Windows |
+| --- | --- | --- | --- | --- |
+| Search, `get -F`, `get --encrypted` | yes | yes | yes | yes |
+| `extract` / `load_macho` on decrypted inputs | yes | yes | yes | yes |
+| `get` (decrypt), `decrypt`, `setup --seed` | yes | no | no | no |
+
+Linux amd64/arm64 and Windows amd64/arm64 are covered by ipatool's official
+release builds. `--gui` is macOS-only; the other platforms use terminal
+prompts.
 
 ## Install
 
-### Homebrew (recommended)
+### Homebrew (macOS, recommended)
 
 ```sh
 brew tap ipakit/ipa-dlp
@@ -49,7 +65,7 @@ Then:
 ipa-dlp setup
 ```
 
-### From source
+### From source (macOS)
 
 ```sh
 git clone https://github.com/ipakit/ipa-dlp.git
@@ -71,13 +87,16 @@ If `~/.local/bin` is not on your `PATH`:
 
 or call the full path.
 
-### pip / pipx
+### pip / pipx (any OS)
 
 ```sh
 pipx install ipa-dlp
 # or
 python3 -m pip install ipa-dlp
 ```
+
+On Linux and Windows this is the supported install path; `install.sh` is
+macOS-only. `ipatool` is fetched for your OS/architecture on first use.
 
 ## Use
 
@@ -93,6 +112,18 @@ ipa-dlp get com.spotify.client --version 9.1.88
 ipa-dlp get 324684580 --version 9.1.88
 ipa-dlp get spotify --version 9.1.88 -o ~/Desktop/Spotify.ipa
 ```
+
+To download the raw FairPlay-encrypted IPA without decrypting (supported on
+any OS):
+
+```sh
+ipa-dlp get spotify --encrypted
+```
+
+On macOS Intel, Linux, and Windows, a plain `ipa-dlp get` exits with a clear
+message; `--encrypted` is the supported download path there. `-F` and
+`extract` work normally. The encrypted IPA still contains `SC_Info`
+licenses and account metadata, so treat it like `--keep-account-data`.
 
 The final path is printed on stdout; progress and diagnostics go to stderr.
 The default output is:
@@ -159,8 +190,8 @@ ipa-dlp extract ./SomeBinary -o SomeBinary.arm64
 For an IPA it reads `CFBundleExecutable`, checks the Mach-O encryption command,
 and extracts directly when the payload is already decrypted. If `cryptid` is
 non-zero, the command requires `SC_Info`, decrypts through UnfairPlay into a
-temporary directory (the usual model/admin rules apply), and extracts from
-that copy. A `.app` or raw Mach-O that is still encrypted cannot be decrypted
+temporary directory on an Apple Silicon Mac (the usual model/admin rules
+apply), and extracts from that copy. A `.app` or raw Mach-O that is still encrypted cannot be decrypted
 in place; it is extracted with a warning. `-o` templates and `--exec` work as
 described below.
 
@@ -209,8 +240,8 @@ ipa-dlp --json status
 ```
 
 Results carry `ok`, `command`, the resolved app, `external_id`, the
-`artifact` path, `ipa`/`binary` paths where relevant, `verified`, and
-`account_data_stripped`. `--list-versions` returns a `versions` array. A
+`artifact` path, `ipa`/`binary`/`encrypted_ipa` paths where relevant,
+`encrypted`, `verified`, and `account_data_stripped`. `--list-versions` returns a `versions` array. A
 failure still prints one object, `{"ok": false, "error": "..."}`, and
 exits non-zero. With `--exec`, the hook's stdout is redirected to stderr so
 the object stays alone on stdout.
@@ -221,6 +252,7 @@ the object stays alone on stdout.
 from ipa_dlp import download, decrypt, extract_binary, load_macho
 
 ipa = download("spotify", version="9.1.88")    # -> Path (decrypted IPA)
+raw = download("spotify", encrypted=True)       # -> Path (encrypted IPA)
 ipa = decrypt("/path/to/App.ipa", output="App.ipa")
 bin_path = extract_binary(ipa)                   # -> Path (<base>.bin)
 data = load_macho("spotify", version="9.1.88")  # -> bytes (arm64 slice)
@@ -233,11 +265,11 @@ Other commands:
 
 ```sh
 ipa-dlp status
-ipa-dlp decrypt /path/to/App.ipa
+ipa-dlp decrypt /path/to/App.ipa   # Apple Silicon Mac
 ipa-dlp extract /path/to/App.ipa
-ipa-dlp setup --update          # reinstall pinned ipatool/UnfairPlay
+ipa-dlp setup --update          # reinstall pinned ipatool (and UnfairPlay on Mac)
 ipa-dlp setup --reauth          # force a new Apple ID login
-ipa-dlp setup --seed spotify    # create the model now instead of on first get
+ipa-dlp setup --seed spotify    # Apple Silicon Mac: create the model now
 ipa-dlp setup --seed spotify --version 9.1.88
 ```
 
@@ -290,26 +322,38 @@ ipa-dlp get some-paid-app --purchase
 
 ## On first run
 
-1. Pinned `ipatool 2.7.0` and `UnfairPlay 0.2.0` releases are downloaded and
-   SHA-256 verified into `~/.local/share/ipa-dlp/bin/`.
-2. You are prompted for your Apple ID and password in the terminal. The
-   password is fed to `ipatool` over a PTY, not as a command-line argument, and
-   is not stored. If Apple asks for a 2FA code, you are prompted for it. Pass
-   `--gui` to use native macOS dialogs instead.
+1. Pinned `ipatool 2.7.0` (and `UnfairPlay 0.2.0` on Apple Silicon Macs)
+   releases are downloaded and SHA-256 verified into
+   `~/.local/share/ipa-dlp/bin/`.
+2. You are prompted for your Apple ID and password in the terminal. On macOS
+   and Linux the password is fed to `ipatool` over a PTY, not as a
+   command-line argument; on Windows ipatool's `--password` flag is used for
+   that login (visible in the process list while it runs). ipa-dlp does not
+   store the password. If Apple asks for a 2FA
+   code, you are prompted for it. Pass `--gui` (macOS) to use native dialogs.
 3. `setup` checks the App Store session and reports the signed-in account.
-4. On the first `get`, the IPA is downloaded, its app bundle is unpacked, and
-   `UnfairPlay` recovers the enrollment model. You are asked for your login
-   password once (in the terminal by default, or in a macOS dialog with
-   `--gui`). The model is saved under
+4. On an Apple Silicon Mac, the first `get` downloads the IPA, unpacks its app
+   bundle, and `UnfairPlay` recovers the enrollment model. You are asked for
+   your login password once (in the terminal by default, or in a macOS dialog
+   with `--gui`). The model is saved under
    `~/Library/Application Support/unfairplay/models` and reused for later IPAs
    from the same enrollment/account.
 5. The IPA is decrypted, account data is stripped, and the output is checked
    against its pre-encryption page hashes before success is reported.
 
-Later `get` calls do not need the admin password.
+On macOS Intel, Linux, and Windows, steps 4-5 do not apply; use
+`ipa-dlp get --encrypted` to keep the raw IPA. Later `get` calls on a Mac do
+not need the admin password.
 
 ## Important limitations
 
+- **Decryption requires an Apple Silicon Mac.** UnfairPlay depends on
+  macOS's FairPlay services, so `get` without `--encrypted`, `decrypt`, and
+  `setup --seed` are unavailable on Intel Macs, Linux, and Windows. Those
+  platforms can still search, list versions, download with `--encrypted`,
+  and extract already-decrypted binaries.
+- **`--encrypted` output is still personalized.** It keeps `SC_Info`
+  licenses and account metadata, so treat it like `--keep-account-data`.
 - **UnfairPlay is build-sensitive.** It may fail closed after a macOS update if
   Apple changes the FairPlay state or `fairplayd`. ipa-dlp reports the error.
 - **The model is tied to the Mac's enrollment and Apple ID.** If you sign in to
@@ -317,14 +361,16 @@ Later `get` calls do not need the admin password.
   needs its own model.
 - **Only "store-owned" apps are supported.** If the account cannot obtain the app/version, the download fails.
 - **No App Store password is stored.** `ipatool` stores its own session token in
-  the macOS Keychain. Revoke it with `ipatool auth revoke` if needed.
+  the system credential store (the macOS Keychain on Mac). Revoke it with
+  `ipatool auth revoke` if needed.
 
 ## Privacy and legal use
 
 Use this only with apps and accounts you lawfully control, and follow Apple's
 terms. Decrypting an app does not grant redistribution rights. Do not share
 personalized or decrypted IPAs. The default output is stripped, but
-`--keep-account-data` output still contains your account licenses.
+`--keep-account-data` and `--encrypted` output still contain your account
+licenses and metadata.
 
 The model file is private. Keep it on encrypted storage and never share it.
 
@@ -342,7 +388,7 @@ UNFAIRPLAY_MODEL_DIR=/tmp/unfairplay-models
 ```
 
 Terminal prompts are the default, which works over SSH and in scripts. Pass
-`--gui` to use native macOS dialogs instead.
+`--gui` (macOS only) to use native dialogs instead.
 
 Useful checks:
 
