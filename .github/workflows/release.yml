@@ -1,17 +1,124 @@
-name: Publish to PyPI
+name: Publish release
+
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example v0.3.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
-  pypi-publish:
+  pypi:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
+    env:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out release tag
+        uses: actions/checkout@v4
         with:
-          python-version: "3.x"
-      - run: pip install build && python -m build
-      - uses: pypa/gh-action-pypi-publish@release/v1
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches package version
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          tag = os.environ["TAG"].strip()
+          text = open("pyproject.toml", encoding="utf-8").read()
+          match = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', text)
+          if not match:
+              sys.exit("could not read project.version from pyproject.toml")
+          version = match.group(1)
+          if tag.lstrip("v") != version:
+              sys.exit(f"tag {tag!r} does not match pyproject version {version!r}")
+          print(f"tag {tag} matches pyproject version {version}")
+          PY
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish to PyPI with trusted publishing
+        if: ${{ !env.PYPI_API_TOKEN }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+      - name: Publish to PyPI with API token
+        if: ${{ env.PYPI_API_TOKEN }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  homebrew:
+    needs: pypi
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require tap write token
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_GITHUB_TOKEN" ]; then
+            echo "::error::Missing TAP_GITHUB_TOKEN. Add a fine-grained PAT with Contents read/write on ipakit/homebrew-ipa-dlp."
+            exit 1
+          fi
+
+      - name: Check out source at the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          path: source
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ipakit/homebrew-ipa-dlp
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: tap
+
+      - name: Update formula and tap README
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: python source/scripts/update_homebrew.py --tag "$TAG" --tap-dir tap
+
+      - name: Validate formula syntax
+        run: ruby -c tap/Formula/ipa-dlp.rb
+
+      - name: Commit and push tap update
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C tap add Formula/ipa-dlp.rb README.md
+          if git -C tap diff --cached --quiet; then
+            echo "Tap already up to date for $TAG"
+            exit 0
+          fi
+          git -C tap commit -m "ipa-dlp ${TAG#v}"
+          git -C tap push origin HEAD:main

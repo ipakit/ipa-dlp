@@ -1,0 +1,97 @@
+name: Auto release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version component to bump
+        type: choice
+        required: true
+        default: auto
+        options:
+          - auto
+          - current
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: Print the release plan without tagging or pushing
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main with tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync to latest main
+        run: |
+          git fetch origin main --tags
+          git reset --hard origin/main
+
+      - name: Require tap write token before releasing
+        if: ${{ inputs.dry_run != true }}
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$TAP_GITHUB_TOKEN" ]; then
+            echo "::error::Missing TAP_GITHUB_TOKEN. Add the tap PAT before pushing a release commit."
+            exit 1
+          fi
+
+      - name: Build check before tagging
+        run: |
+          python -m pip install --upgrade build
+          python -m py_compile ipa_dlp.py ipa-dlp scripts/*.py
+          python -m build --outdir /tmp/ipa-dlp-dist
+
+      - name: Create version bump, tag, and GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump || 'auto' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          TRIGGER_SHA: ${{ github.event.after || github.sha }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python scripts/auto_release.py --bump "$BUMP" --dry-run --trigger-sha "$TRIGGER_SHA"
+          else
+            python scripts/auto_release.py --bump "$BUMP" --trigger-sha "$TRIGGER_SHA"
+          fi
+
+      # Releases created with GITHUB_TOKEN do not trigger `release: published`
+      # workflows. Dispatch the publish job explicitly; this also makes the
+      # chain independent of the token type.
+      - name: Dispatch PyPI and Homebrew publish
+        if: ${{ inputs.dry_run != true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: gh workflow run release.yml --ref main -f tag="$TAG"

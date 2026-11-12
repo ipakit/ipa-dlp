@@ -399,3 +399,6 @@ ipa-dlp --json status
 ipa-dlp get spotify --version 9.1.88 --dry-run
 python3 -m build          # wheel + sdist (needs flit_core)
 ```
+
+See [RELEASING.md](RELEASING.md) for the automated tag → PyPI → Homebrew
+pipeline and the one-time repository secrets.
