@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
+import difflib
 import getpass
 import hashlib
 import json
@@ -117,23 +119,6 @@ ACCOUNT_METADATA_KEYS = frozenset(
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
-def _use_color() -> bool:
-    """Return True when stderr is a TTY and NO_COLOR is not set."""
-    return sys.stderr.isatty() and not os.environ.get("NO_COLOR")
-
-
-# Tag colors: cyan for ipa-dlp, green for ipatool, magenta for unfairplay,
-# blue for download, yellow for versions.
-_TAG_COLORS: Dict[str, str] = {
-    "ipa-dlp": "\x1b[36m",     # cyan
-    "ipatool": "\x1b[32m",     # green
-    "unfairplay": "\x1b[35m",  # magenta
-    "download": "\x1b[34m",    # blue
-    "versions": "\x1b[33m",    # yellow
-}
-_RESET = "\x1b[0m"
-
-
 class CliError(Exception):
     pass
 
@@ -143,50 +128,311 @@ class Cancelled(CliError):
 
 
 # ---------------------------------------------------------------------------
-# small helpers
+# terminal styling / semantic output
 # ---------------------------------------------------------------------------
+
+_COLOR_CODES = {
+    "bold": "1",
+    "dim": "2",
+    "red": "31",
+    "green": "32",
+    "yellow": "33",
+    "blue": "34",
+    "magenta": "35",
+    "cyan": "36",
+    "white": "37",
+}
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_SPINNER_INTERVAL = 0.08
+_SPINNER_LOCK = threading.RLock()
+_ACTIVE_SPINNER: Optional["Spinner"] = None
+_PROGRESS_ACTIVE = False
+_PROMPT_ACTIVE = False
+
+
+def _color_override() -> Optional[bool]:
+    """Return an explicit color decision from the environment, if any."""
+    if "NO_COLOR" in os.environ:
+        return False
+    if "FORCE_COLOR" in os.environ:
+        value = os.environ.get("FORCE_COLOR", "").strip().lower()
+        return value not in ("0", "false", "no", "off")
+    if os.environ.get("TERM", "").strip().lower() == "dumb":
+        return False
+    return None
+
+
+def _stream_wants_color(stream: Any) -> bool:
+    override = _color_override()
+    if override is not None:
+        return override
+    try:
+        return bool(stream.isatty())
+    except Exception:
+        return False
+
+
+def use_color_stderr() -> bool:
+    """Return True when styled stderr output should be emitted."""
+    return _stream_wants_color(sys.stderr)
+
+
+def use_color_stdout() -> bool:
+    """Return True when styled stdout output should be emitted.
+
+    JSON output is machine-readable, so color is always disabled there even
+    when a caller forces color globally.
+    """
+    if JSON_OUTPUT:
+        return False
+    return _stream_wants_color(sys.stdout)
+
+
+def style(text: Any, *codes: Any, stream: Any = None) -> str:
+    """Wrap *text* in ANSI styles when *stream* supports color."""
+    target = sys.stderr if stream is None else stream
+    text = str(text)
+    if target is sys.stdout and JSON_OUTPUT:
+        return text
+    if not codes or not _stream_wants_color(target):
+        return text
+    values: List[str] = []
+    for code in codes:
+        if code is None or code == "":
+            continue
+        mapped = _COLOR_CODES.get(str(code), str(code))
+        if mapped:
+            values.append(mapped)
+    if not values:
+        return text
+    return "\x1b[%sm%s\x1b[0m" % (";".join(values), text)
+
+
+def _stderr_silent() -> bool:
+    """True when human stderr output is suppressed for machine output."""
+    return JSON_OUTPUT and not VERBOSE
+
+
+@contextlib.contextmanager
+def hidden_cursor(stream: Any = None):
+    """Hide the terminal cursor while a live region is being redrawn."""
+    target = sys.stderr if stream is None else stream
+    hidden = False
+    try:
+        if not JSON_OUTPUT and target.isatty():
+            target.write("\x1b[?25l")
+            target.flush()
+            hidden = True
+        yield
+    finally:
+        if hidden:
+            try:
+                target.write("\x1b[?25h")
+                target.flush()
+            except Exception:
+                pass
+
+
+def _write_stderr(text: str) -> None:
+    """Write one complete stderr line, clearing any live region first."""
+    global _PROGRESS_ACTIVE
+    with _SPINNER_LOCK:
+        if _ACTIVE_SPINNER is not None or _PROGRESS_ACTIVE:
+            sys.stderr.write("\r\x1b[K")
+        _PROGRESS_ACTIVE = False
+        sys.stderr.write(text)
+        sys.stderr.flush()
 
 
 def eprint(*args: Any, **kwargs: Any) -> None:
-    kwargs.setdefault("file", sys.stderr)
-    print(*args, **kwargs)
-
-
-def log(message: str, tag: str = "ipa-dlp") -> None:
-    if _use_color():
-        color = _TAG_COLORS.get(tag, "")
-        reset = _RESET if color else ""
-        eprint("%s[%s]%s %s" % (color, tag, reset, message))
+    if kwargs.get("file", sys.stderr) is sys.stderr:
+        end = kwargs.get("end", "\n")
+        sep = kwargs.get("sep", " ")
+        _write_stderr(sep.join(str(arg) for arg in args) + end)
     else:
-        eprint("[%s] %s" % (tag, message))
+        print(*args, **kwargs)
 
 
-def _progress_line(message: str, tag: str = "download") -> None:
-    """Overwrite the current line with a progress message (TTY only)."""
-    if JSON_OUTPUT and not VERBOSE:
+def stage(message: str) -> None:
+    """Print a Homebrew-style stage header (``==>`` + bold message)."""
+    if _stderr_silent():
         return
-    if sys.stderr.isatty():
-        if _use_color():
-            color = _TAG_COLORS.get(tag, "")
-            reset = _RESET if color else ""
-            sys.stderr.write("\r\x1b[K%s[%s]%s %s" % (color, tag, reset, message))
-        else:
-            sys.stderr.write("\r\x1b[K[%s] %s" % (tag, message))
-        sys.stderr.flush()
-    else:
-        eprint("[%s] %s" % (tag, message))
+    _write_stderr(
+        "%s %s\n"
+        % (
+            style("==>", "1", "34"),
+            style(message, "1", "37"),
+        )
+    )
 
 
-def _finish_progress() -> None:
-    """End a progress line by writing a newline (TTY only)."""
-    if sys.stderr.isatty():
-        sys.stderr.write("\n")
-        sys.stderr.flush()
+def detail(message: str) -> None:
+    """Print dim, indented secondary output."""
+    if _stderr_silent():
+        return
+    _write_stderr(style("  " + message, "2") + "\n")
+
+
+def success(message: str) -> None:
+    """Print a bold green checkmark and message."""
+    if _stderr_silent():
+        return
+    _write_stderr("%s %s\n" % (style("✓", "1", "32"), message))
+
+
+def warn(message: str) -> None:
+    """Print a bold yellow warning marker and message."""
+    if _stderr_silent():
+        return
+    _write_stderr("%s %s\n" % (style("!", "1", "33"), message))
+
+
+def error(message: str) -> None:
+    """Print a bold red ``Error:`` and message."""
+    _write_stderr("%s %s\n" % (style("Error:", "1", "31"), message))
 
 
 def vlog(message: str) -> None:
     if VERBOSE:
-        eprint(message)
+        _write_stderr(message + "\n")
+
+
+class Spinner:
+    """A Braille spinner on stderr for otherwise silent blocking work."""
+
+    def __init__(self, label: str, stream: Any = None):
+        self.label = label
+        self.stream = sys.stderr if stream is None else stream
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._cursor: Any = None
+        self._owns = False
+
+    def _enabled(self) -> bool:
+        if JSON_OUTPUT and not VERBOSE:
+            return False
+        try:
+            return bool(self.stream.isatty())
+        except Exception:
+            return False
+
+    def _spin(self) -> None:
+        index = 0
+        while not self._stop.wait(_SPINNER_INTERVAL):
+            if _PROMPT_ACTIVE:
+                continue
+            line = "%s %s" % (
+                style(
+                    _SPINNER_FRAMES[index % len(_SPINNER_FRAMES)],
+                    "36",
+                    stream=self.stream,
+                ),
+                style(self.label, "2", stream=self.stream),
+            )
+            try:
+                with _SPINNER_LOCK:
+                    if _PROMPT_ACTIVE:
+                        continue
+                    self.stream.write("\r\x1b[K" + line)
+                    self.stream.flush()
+            except Exception:
+                break
+            index += 1
+
+    def __enter__(self) -> "Spinner":
+        global _ACTIVE_SPINNER
+        if not self._enabled():
+            return self
+        with _SPINNER_LOCK:
+            if _ACTIVE_SPINNER is not None:
+                return self
+            _ACTIVE_SPINNER = self
+            self._owns = True
+        self._cursor = hidden_cursor(self.stream)
+        self._cursor.__enter__()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        global _ACTIVE_SPINNER
+        if not self._owns:
+            return
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        try:
+            with _SPINNER_LOCK:
+                self.stream.write("\r\x1b[K")
+                self.stream.flush()
+        except Exception:
+            pass
+        if self._cursor is not None:
+            self._cursor.__exit__(exc_type, exc, tb)
+        with _SPINNER_LOCK:
+            _ACTIVE_SPINNER = None
+
+
+def _spinner_frame(elapsed: float) -> str:
+    return _SPINNER_FRAMES[
+        int(max(0.0, elapsed) / _SPINNER_INTERVAL) % len(_SPINNER_FRAMES)
+    ]
+
+
+def _stream_columns(stream: Any) -> int:
+    """Return the terminal width of *stream*, not of stdout."""
+    try:
+        columns = int(os.get_terminal_size(stream.fileno()).columns)
+        if columns > 0:
+            return columns
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        value = int(os.environ.get("COLUMNS", ""))
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else 80
+
+
+def _activity_text(label: str, elapsed: float = 0.0) -> str:
+    return "  %s %s" % (
+        style(_spinner_frame(elapsed), "36"),
+        style(label, "2"),
+    )
+
+
+def _progress_line(message: str) -> None:
+    """Overwrite the current stderr line with a progress message (TTY only)."""
+    global _PROGRESS_ACTIVE
+    if _stderr_silent() or not sys.stderr.isatty():
+        return
+    with _SPINNER_LOCK:
+        sys.stderr.write("\r\x1b[K" + message)
+        sys.stderr.flush()
+        _PROGRESS_ACTIVE = True
+
+
+def _finish_progress() -> None:
+    """End a live progress line with a newline (TTY only)."""
+    global _PROGRESS_ACTIVE
+    if not _PROGRESS_ACTIVE:
+        return
+    with _SPINNER_LOCK:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        _PROGRESS_ACTIVE = False
+
+
+def _clear_progress_line() -> None:
+    """Erase the live progress line so streamed output can be written."""
+    global _PROGRESS_ACTIVE
+    if _stderr_silent() or not sys.stderr.isatty() or not _PROGRESS_ACTIVE:
+        return
+    with _SPINNER_LOCK:
+        sys.stderr.write("\r\x1b[K")
+        sys.stderr.flush()
+        _PROGRESS_ACTIVE = False
 
 
 def strip_ansi(text: str) -> str:
@@ -377,7 +623,7 @@ def ask_text(
             except CliError as exc:
                 if isinstance(exc, Cancelled):
                     raise
-                log("dialog unavailable (%s); falling back to Terminal" % exc)
+                warn("dialog unavailable (%s); falling back to Terminal" % exc)
                 value = _terminal_prompt(message, secret, default)
         else:
             value = _terminal_prompt(message, secret, default)
@@ -385,17 +631,54 @@ def ask_text(
             value = value.strip()
         if value or allow_empty:
             return value
-        log("A value is required.")
+        warn("A value is required.")
+
+
+def _prompt_read(prompt: str, secret: bool = False) -> str:
+    """Read one line from stdin while writing the prompt to stderr."""
+    global _PROMPT_ACTIVE
+    with _SPINNER_LOCK:
+        if _ACTIVE_SPINNER is not None:
+            sys.stderr.write("\r\x1b[K")
+            sys.stderr.flush()
+        _PROMPT_ACTIVE = True
+    completed = False
+    try:
+        if secret:
+            try:
+                value = getpass.getpass(prompt, stream=sys.stderr)
+            except TypeError:  # pragma: no cover - very old Python
+                value = getpass.getpass(prompt)
+            completed = True
+            return value
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+        line = sys.stdin.readline()
+        if line == "":
+            raise EOFError
+        completed = True
+        return line.rstrip("\n")
+    finally:
+        _PROMPT_ACTIVE = False
+        try:
+            echo_ends_line = sys.stdin.isatty() and sys.stderr.isatty()
+            if not completed or (not secret and not echo_ends_line):
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+        except Exception:
+            pass
 
 
 def _terminal_prompt(message: str, secret: bool, default: str) -> str:
-    if secret:
-        return getpass.getpass("%s: " % message)
-    prompt = "%s" % message
+    prompt = style(message, "1")
+    if not message.rstrip().endswith((":", "?", "!")):
+        prompt += ":"
     if default:
-        prompt += " [%s]" % default
-    prompt += ": "
-    value = input(prompt)
+        prompt += " [%s]" % style(default, "2")
+    prompt += " "
+    value = _prompt_read(prompt, secret=secret)
+    if secret:
+        return value
     return value if value else default
 
 
@@ -407,7 +690,7 @@ def ask_yes_no(title: str, message: str) -> bool:
             return False
         except CliError:
             pass
-    answer = input("%s [y/N]: " % message)
+    answer = _prompt_read("%s [y/N]: " % style(message, "1"))
     return answer.strip().lower() in ("y", "yes")
 
 
@@ -436,7 +719,7 @@ def choose_item(title: str, prompt: str, items: List[str]) -> str:
         eprint("  %d. %s" % (index, item))
     while True:
         try:
-            answer = input("Select [1-%d]: " % len(items)).strip()
+            answer = _prompt_read("Select [1-%d]: " % len(items)).strip()
         except EOFError as exc:
             raise CliError("selection canceled") from exc
         if answer.isdigit() and 1 <= int(answer) <= len(items):
@@ -448,7 +731,7 @@ def _arrow_select(prompt: str, items: List[str]) -> str:
     selected = 0
     # How many items to show at once (scrollable window).
     max_visible = min(len(items), 12)
-    use_color = _use_color()
+    use_color = use_color_stderr()
 
     def _render(sel: int) -> None:
         # Determine the visible window around the selection.
@@ -552,29 +835,40 @@ def download_file(url: str, destination: Path, expected: Optional[str] = None) -
     part = destination.with_name(destination.name + ".part")
     if part.exists():
         part.unlink()
-    log("downloading %s" % destination.name, tag="download")
-    completed = subprocess.run(
-        [
-            "curl",
-            "-fL",
-            "--retry",
-            "3",
-            "--connect-timeout",
-            "20",
-            "--silent",
-            "--show-error",
-            "-o",
-            str(part),
-            url,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    if completed.returncode != 0:
-        raise CliError(
-            "download failed: %s" % (completed.stderr.strip() or url)
+    detail("Downloading %s..." % destination.name)
+    live_progress = sys.stderr.isatty() and not JSON_OUTPUT
+    cmd = [
+        "curl",
+        "-fL",
+        "--retry",
+        "3",
+        "--connect-timeout",
+        "20",
+        "--progress-bar" if live_progress else "--silent",
+        "--show-error",
+        "-o",
+        str(part),
+        url,
+    ]
+    if live_progress:
+        with hidden_cursor():
+            completed = subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=None,
+                text=True,
+                timeout=600,
+            )
+    else:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
         )
+    if completed.returncode != 0:
+        message = (completed.stderr or "").strip() if completed.stderr else ""
+        raise CliError("download failed: %s" % (message or url))
     if expected:
         actual = sha256_file(part)
         if actual != expected.lower():
@@ -648,19 +942,22 @@ def install_ipatool() -> None:
         raise CliError("no pinned checksum for ipatool asset %s" % name)
     base = "https://github.com/majd/ipatool/releases/download/v%s" % IPATOOL_VERSION
     archive = CACHE_DIR / "downloads" / name
+    stage("Installing ipatool %s..." % IPATOOL_VERSION)
     download_file(base + "/" + name, archive, checksum)
     root = extract_tar(archive)
     try:
         install_binary(find_binary(root, "ipatool"), ipatool_path())
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    log("installed ipatool %s at %s" % (IPATOOL_VERSION, ipatool_path()), tag="ipatool")
+    success("Installed ipatool %s" % IPATOOL_VERSION)
+    detail(str(ipatool_path()))
 
 
 def install_unfairplay() -> None:
     name = "unfairplay-v%s-darwin-arm64.tar.gz" % UNFAIRPLAY_VERSION
     base = "https://github.com/DrWhax/unfairplay/releases/download/v%s" % UNFAIRPLAY_VERSION
     archive = CACHE_DIR / "downloads" / name
+    stage("Installing UnfairPlay %s..." % UNFAIRPLAY_VERSION)
     download_file(base + "/" + name, archive, UNFAIRPLAY_SHA256)
     root = extract_tar(archive)
     try:
@@ -674,7 +971,8 @@ def install_unfairplay() -> None:
                 shutil.copy2(str(item), str(license_dir / item.name))
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    log("installed UnfairPlay %s at %s" % (UNFAIRPLAY_VERSION, unfairplay_path()), tag="unfairplay")
+    success("Installed UnfairPlay %s" % UNFAIRPLAY_VERSION)
+    detail(str(unfairplay_path()))
 
 
 def _tool_ready(path: Path) -> bool:
@@ -933,7 +1231,7 @@ def ensure_auth(force: bool = False) -> Dict[str, Any]:
 
     last_output = ""
     for attempt in range(1, 4):
-        log("signing in to the App Store...", tag="ipatool")
+        stage("Signing in to the App Store...")
         if HAS_PTY:
             _, output = login_pty(email, password, ask_code)
         else:
@@ -943,13 +1241,13 @@ def ensure_auth(force: bool = False) -> Dict[str, Any]:
         if info:
             config["email"] = str(info.get("email") or email)
             save_config(config)
-            log(
-                "signed in as %s"
+            success(
+                "Signed in as %s"
                 % (info.get("email") or info.get("name") or email)
             )
             return info
         if attempt < 3:
-            log("login failed; %s" % tail(output, 1200), tag="ipatool")
+            warn("Login failed; %s" % tail(output, 1200))
             if not ask_yes_no(
                 "ipa-dlp",
                 "Apple ID login failed. Try again with a new password/code?",
@@ -1023,7 +1321,8 @@ def resolve_app(query: str, platform_name: str = DEFAULT_PLATFORM) -> Dict[str, 
         raise CliError("app name, bundle ID, or App Store ID is required")
 
     if query.isdigit():
-        found = itunes_lookup({"id": query}, platform_name)
+        with Spinner("Resolving app %s..." % query):
+            found = itunes_lookup({"id": query}, platform_name)
         if found:
             return found
         return {
@@ -1037,7 +1336,8 @@ def resolve_app(query: str, platform_name: str = DEFAULT_PLATFORM) -> Dict[str, 
         re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", query)
     )
     if bundle_like:
-        found = itunes_lookup({"bundleId": query}, platform_name)
+        with Spinner("Resolving bundle %s..." % query):
+            found = itunes_lookup({"bundleId": query}, platform_name)
         if found:
             return found
         # Do not fall back to fuzzy name search for an explicit bundle ID.
@@ -1045,7 +1345,8 @@ def resolve_app(query: str, platform_name: str = DEFAULT_PLATFORM) -> Dict[str, 
             "bundle ID %r was not found in the App Store" % query
         )
 
-    apps = search_apps(query)
+    with Spinner("Searching the App Store for %r..." % query):
+        apps = search_apps(query)
     if not apps:
         raise CliError("no App Store results for %r" % query)
 
@@ -1201,25 +1502,48 @@ def _release_date(value: Any) -> str:
 
 
 def render_versions_table(rows: Sequence[Dict[str, str]]) -> None:
-    """Print an aligned EXTERNAL_ID / VERSION / RELEASE_DATE table."""
+    """Print an aligned, optionally colored versions table."""
     headers = ("EXTERNAL_ID", "VERSION", "RELEASE_DATE")
     width_id = max([len(headers[0])] + [len(row["external_id"]) for row in rows])
     width_version = max([len(headers[1])] + [len(row["version"]) for row in rows])
-    print(
-        "%-*s  %-*s  %s"
-        % (width_id, headers[0], width_version, headers[1], headers[2])
-    )
-    for row in rows:
+    color = use_color_stdout()
+    out = sys.stdout
+
+    if color:
+        first = style(
+            "%-*s" % (width_id, headers[0]), "1", "36", stream=out
+        )
+        second = style(
+            "%-*s" % (width_version, headers[1]), "1", "32", stream=out
+        )
+        third = style(headers[2], "1", "2", stream=out)
+        print("%s  %s  %s" % (first, second, third))
+    else:
         print(
             "%-*s  %-*s  %s"
-            % (
-                width_id,
-                row["external_id"],
-                width_version,
-                row["version"],
-                row["released"],
-            )
+            % (width_id, headers[0], width_version, headers[1], headers[2])
         )
+    for row in rows:
+        if color:
+            external = style(
+                "%-*s" % (width_id, row["external_id"]), "36", stream=out
+            )
+            version = style(
+                "%-*s" % (width_version, row["version"]), "32", stream=out
+            )
+            released = style(row["released"], "2", stream=out)
+            print("%s  %s  %s" % (external, version, released))
+        else:
+            print(
+                "%-*s  %-*s  %s"
+                % (
+                    width_id,
+                    row["external_id"],
+                    width_version,
+                    row["version"],
+                    row["released"],
+                )
+            )
 
 
 def list_versions_table(
@@ -1235,7 +1559,8 @@ def list_versions_table(
     """
     if limit < 1:
         raise CliError("--limit must be at least 1")
-    ids = list_external_versions(app_id)[:limit]
+    with Spinner("Listing versions..."):
+        ids = list_external_versions(app_id)[:limit]
     if not ids:
         raise CliError("App Store returned no versions for app %s" % app_id)
 
@@ -1245,8 +1570,7 @@ def list_versions_table(
     if pending:
         def progress(done: int, total: int) -> None:
             _progress_line(
-                "Fetching metadata: %d/%d" % (done, total),
-                tag="versions",
+                _activity_text("Fetching metadata: %d/%d" % (done, total))
             )
 
         try:
@@ -1335,7 +1659,8 @@ def resolve_version(
         if isinstance(metadata, dict) and str(metadata.get("displayVersion")) == wanted:
             return ext, metadata
 
-    ids = list_external_versions(app_id)
+    with Spinner("Finding version %s..." % wanted):
+        ids = list_external_versions(app_id)
     if not ids:
         raise CliError("App Store returned no versions for app %s" % app_id)
 
@@ -1351,8 +1676,7 @@ def resolve_version(
             if fetched:
                 probes += 1
                 _progress_line(
-                    "Checking metadata: probe %d" % probes,
-                    tag="versions",
+                    _activity_text("Checking metadata: probe %d" % probes)
                 )
             if metadata is None:
                 # A failed response hides the ordering; scan the remaining
@@ -1421,14 +1745,6 @@ def app_is_free(app: Dict[str, Any]) -> bool:
         return str(value).strip() in ("0", "0.00", "Free")
 
 
-def _clear_progress_line() -> None:
-    """Erase the live progress line so streamed output can be written."""
-    if JSON_OUTPUT or not sys.stderr.isatty():
-        return
-    sys.stderr.write("\r\x1b[K")
-    sys.stderr.flush()
-
-
 def _percent_from_line(line: str) -> Optional[float]:
     matches = re.findall(r"(\d{1,3}(?:\.\d+)?)\s*%", line)
     if not matches:
@@ -1451,13 +1767,14 @@ def _is_json_line(line: str) -> bool:
     return True
 
 
-def _stream_line(line: str, tag: str, lock: "threading.Lock") -> None:
+def _stream_line(line: str, lock: "threading.Lock") -> None:
     text = strip_ansi(line).rstrip()
     if not text:
         return
     with lock:
-        _clear_progress_line()
-        log(text, tag=tag)
+        with _SPINNER_LOCK:
+            _clear_progress_line()
+            detail(text)
 
 
 def _format_duration(seconds: float) -> str:
@@ -1477,37 +1794,102 @@ def _progress_text(
     elapsed: float,
     percent: Optional[float],
     total_megabytes: Optional[float] = None,
+    *,
+    eta_available: bool = True,
+    done: bool = False,
+    columns: Optional[int] = None,
 ) -> str:
-    if percent is not None:
-        percent = max(0.0, min(100.0, percent))
-        width = 24
-        filled = max(0, min(width, int(width * percent / 100.0)))
-        bar = "█" * filled + "░" * (width - filled)
-        if total_megabytes:
-            if speed > 0:
-                eta = _format_duration(
-                    max(0.0, total_megabytes - megabytes) / speed
+    """Render one Homebrew-style, width-clamped progress line."""
+    columns = columns or _stream_columns(sys.stderr)
+    limit = max(0, columns - 1)
+    if limit <= 0:
+        return ""
+
+    if percent is None:
+        if megabytes > 0:
+            if speed >= 0.05:
+                label = "%.1f MiB at %.1f MiB/s (%s)" % (
+                    megabytes,
+                    speed,
+                    _format_duration(elapsed),
                 )
             else:
-                eta = "--:--"
-            return "[%s] %5.1f%% of %.1fMiB at %.1fMiB/s ETA %s" % (
-                bar,
-                percent,
-                total_megabytes,
-                speed,
-                eta,
-            )
-        return "[%s] %5.1f%% at %.1fMiB/s (%s)" % (
-            bar,
-            percent,
-            speed,
+                label = "%.1f MiB (%s)" % (
+                    megabytes,
+                    _format_duration(elapsed),
+                )
+        else:
+            label = "Connecting to App Store..."
+        room = limit - 4
+        if room <= 0:
+            return style(_spinner_frame(elapsed), "36")
+        if len(label) > room:
+            label = label[: max(0, room - 3)] + ("..." if room > 3 else "")
+        return "  %s %s" % (
+            style(_spinner_frame(elapsed), "36"),
+            style(label, "2"),
+        )
+
+    percent = max(0.0, min(100.0, percent))
+    pct_plain = "%5.1f%%" % percent
+    pct_styled = style(pct_plain, "1", "32" if done else "")
+
+    groups: List[Tuple[str, str]] = []
+    if done:
+        summary = "%.1f MiB in %s" % (
+            megabytes,
             _format_duration(elapsed),
         )
-    return "%.1fMiB at %.1fMiB/s (%s)" % (
-        megabytes,
-        speed,
-        _format_duration(elapsed),
+        groups.append((summary, style(summary, "32")))
+    else:
+        if total_megabytes:
+            size = "%.1f / %.1f MiB" % (megabytes, total_megabytes)
+        else:
+            size = "%.1f MiB" % megabytes
+        groups.append((size, style(size, "2")))
+        if speed >= 0.05:
+            rate = "%.1f MiB/s" % speed
+            groups.append((rate, style(rate, "36")))
+        if total_megabytes and eta_available and speed >= 0.05:
+            eta = "ETA " + _format_duration(
+                max(0.0, total_megabytes - megabytes) / speed
+            )
+            groups.append((eta, style(eta, "2")))
+
+    prefix = "  "
+    chosen: Optional[Tuple[int, str, int]] = None
+    for take in range(len(groups), -1, -1):
+        suffix_plain = "  ".join(group[0] for group in groups[:take])
+        overhead = (
+            len(prefix)
+            + 1
+            + len(pct_plain)
+            + (2 + len(suffix_plain) if suffix_plain else 0)
+        )
+        width = min(28, limit - overhead)
+        if width >= 8:
+            suffix_styled = "  ".join(group[1] for group in groups[:take])
+            chosen = (width, suffix_styled, take)
+            break
+
+    if chosen is None:
+        # Extremely narrow terminal: keep just the percentage readable.
+        if len(pct_plain) <= limit:
+            return pct_styled
+        raw = "%.0f%%" % percent
+        if len(raw) > limit:
+            raw = ("%.1f%%" % percent)[:limit]
+        return style(raw, "1", "32" if done else "")
+
+    width, suffix_styled, _ = chosen
+    filled = width if done else max(
+        0, min(width, int(width * percent / 100.0))
     )
+    bar = style("█" * filled, "32") + style("░" * (width - filled), "2")
+    pieces = [prefix, bar, " ", pct_styled]
+    if suffix_styled:
+        pieces.append("  " + suffix_styled)
+    return "".join(pieces)
 
 
 def _watch_size(watch: Optional[Path]) -> Optional[int]:
@@ -1536,16 +1918,14 @@ def run_with_progress(
     label: str,
     timeout: int = 1800,
     total_bytes: Optional[int] = None,
-    tag: str = "download",
 ) -> Tuple[int, str]:
-    """Run *argv* while streaming stdout/stderr and reporting progress.
+    """Run *argv* while streaming output and drawing a Homebrew-style bar.
 
-    Both pipes are read line by line on reader threads, so tool output appears
-    immediately instead of only on failure. The download directory is watched
-    for live bytes; a known *total_bytes*
-    or a percentage in the tool's output drives a single progress line with a
-    bar, percentage, speed, and ETA. The line is cleared with
-    ``\\r\\x1b[K`` before any streamed line is written.
+    The first few seconds of ``ipatool`` are spent authenticating and resolving
+    the store URL, before a temporary file exists. That interval shows an
+    animated ``Connecting to App Store...`` spinner rather than bare elapsed
+    seconds. Once bytes appear, speed is smoothed with an exponential moving
+    average and the bar is clamped to ``columns - 1`` so it never wraps.
     """
     cmd = [str(item) for item in argv]
     vlog("+ " + " ".join(cmd))
@@ -1553,10 +1933,13 @@ def run_with_progress(
     last_report = 0.0
     last_size = 0.0
     last_speed_time = started
+    first_sample = False
+    ema_speed: Optional[float] = None
+    total_megabytes = total_bytes / (1024 * 1024) if total_bytes else None
+    eta_available = True
     output_chunks: list[str] = []
     lock = threading.Lock()
     state: Dict[str, Optional[float]] = {"percent": None}
-    total_megabytes = total_bytes / (1024 * 1024) if total_bytes else None
 
     try:
         process = subprocess.Popen(
@@ -1571,7 +1954,7 @@ def run_with_progress(
         raise CliError("missing command: %s" % cmd[0]) from exc
     assert process.stdout is not None and process.stderr is not None
 
-    def reader(stream: Any, stream_tag: str) -> None:
+    def reader(stream: Any) -> None:
         try:
             for raw in stream:
                 line = raw.rstrip("\n")
@@ -1584,7 +1967,7 @@ def run_with_progress(
                 if _is_json_line(line):
                     # ipatool's machine-readable result line is parsed later.
                     continue
-                _stream_line(line, stream_tag, lock)
+                _stream_line(line, lock)
         finally:
             try:
                 stream.close()
@@ -1592,53 +1975,110 @@ def run_with_progress(
                 pass
 
     threads = [
-        threading.Thread(target=reader, args=(process.stdout, tag), daemon=True),
-        threading.Thread(target=reader, args=(process.stderr, tag), daemon=True),
+        threading.Thread(target=reader, args=(process.stdout,), daemon=True),
+        threading.Thread(target=reader, args=(process.stderr,), daemon=True),
     ]
     for thread in threads:
         thread.start()
 
     try:
-        while process.poll() is None:
-            now = time.time()
-            if now - started > timeout:
-                raise CliError("%s timed out" % label)
-            interval = 0.5 if sys.stderr.isatty() else 15
-            if now - last_report >= interval:
-                last_report = now
-                elapsed = now - started
-                size = _watch_size(watch)
-                if size is not None:
-                    megabytes = size / (1024 * 1024)
-                    dt = now - last_speed_time
-                    speed = (megabytes - last_size) / dt if dt > 0 else 0.0
-                    last_size = megabytes
-                    last_speed_time = now
-                    percent = state["percent"]
-                    if total_bytes:
-                        percent = 100.0 * size / total_bytes
+        with hidden_cursor():
+            try:
+                while process.poll() is None:
+                    now = time.time()
+                    if now - started > timeout:
+                        raise CliError("%s timed out" % label)
+                    elapsed = now - started
+                    size = _watch_size(watch)
+                    if size is None or size == 0:
+                        if now - last_report >= _SPINNER_INTERVAL:
+                            last_report = now
+                            _progress_line(
+                                _progress_text(0.0, 0.0, elapsed, None)
+                            )
+                    else:
+                        megabytes = size / (1024 * 1024)
+                        if not first_sample:
+                            first_sample = True
+                            last_size = megabytes
+                            last_speed_time = now
+                        elif now - last_speed_time >= 0.2:
+                            dt = now - last_speed_time
+                            instant = (
+                                max(0.0, (megabytes - last_size) / dt)
+                                if dt > 0
+                                else 0.0
+                            )
+                            if ema_speed is None:
+                                ema_speed = instant
+                            else:
+                                ema_speed = (
+                                    0.25 * instant + 0.75 * ema_speed
+                                )
+                            last_size = megabytes
+                            last_speed_time = now
+                        if now - last_report >= 0.2:
+                            last_report = now
+                            percent = state["percent"]
+                            if percent is None and total_bytes:
+                                percent = 100.0 * size / total_bytes
+                            if total_bytes and size >= total_bytes:
+                                # fileSizeBytes is an estimate; grow the total
+                                # instead of parking at 100% before completion.
+                                total_bytes = max(total_bytes or 0, size)
+                                total_megabytes = max(
+                                    total_megabytes or 0.0, megabytes
+                                )
+                                eta_available = False
+                                percent = 99.0
+                            elif percent is not None:
+                                percent = min(99.0, percent)
+                            _progress_line(
+                                _progress_text(
+                                    megabytes,
+                                    ema_speed or 0.0,
+                                    elapsed,
+                                    percent,
+                                    total_megabytes,
+                                    eta_available=eta_available,
+                                )
+                            )
+                    time.sleep(0.05)
+                process.wait()
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+            finally:
+                for thread in threads:
+                    thread.join(timeout=5)
+                elapsed = time.time() - started
+                final_size = 0
+                if watch is not None:
+                    try:
+                        final_size = watch.stat().st_size
+                    except OSError:
+                        final_size = 0
+                if process.returncode == 0 and final_size > 0:
+                    final_megabytes = final_size / (1024 * 1024)
+                    final_speed = (
+                        final_megabytes / elapsed if elapsed > 0 else 0.0
+                    )
                     _progress_line(
                         _progress_text(
-                            megabytes,
-                            speed,
+                            final_megabytes,
+                            final_speed,
                             elapsed,
-                            percent,
-                            total_megabytes,
-                        ),
-                        tag=tag,
+                            100.0,
+                            None,
+                            done=True,
+                        )
                     )
-                else:
-                    _progress_line("%.0fs" % elapsed, tag=tag)
-            time.sleep(0.05)
-        process.wait()
-    except Exception:
+                _finish_progress()
+    except BaseException:
         process.kill()
         process.wait()
         raise
-    finally:
-        for thread in threads:
-            thread.join(timeout=5)
-        _finish_progress()
 
     return process.returncode, "".join(output_chunks)
 
@@ -1661,7 +2101,8 @@ def download_ipa(
         # does, and it is what makes the bar and ETA possible. For a pinned
         # older version this is the current version's size, so the bar is an
         # estimate, but still far more useful than no ETA.
-        looked_up = itunes_lookup({"id": app_id}, platform_name)
+        with Spinner("Preparing download..."):
+            looked_up = itunes_lookup({"id": app_id}, platform_name)
         if looked_up:
             try:
                 total_bytes = int(looked_up.get("size") or 0)
@@ -1786,7 +2227,8 @@ def read_app_info(app_dir: Path) -> Dict[str, Any]:
 
 def extract_app(ipa: Path) -> Tuple[Path, Path]:
     root = Path(tempfile.mkdtemp(prefix="ipa-dlp-ipa-"))
-    completed = run(["ditto", "-x", "-k", ipa, root], timeout=600, check=False)
+    with Spinner("Unpacking IPA..."):
+        completed = run(["ditto", "-x", "-k", ipa, root], timeout=600, check=False)
     if completed.returncode != 0:
         shutil.rmtree(root, ignore_errors=True)
         raise CliError("could not unpack IPA: %s" % tail(completed.stderr))
@@ -1965,7 +2407,8 @@ def doctor(ipa: Optional[Path] = None) -> Optional[Dict[str, Any]]:
     ]
     if ipa is not None:
         cmd.extend(["--ipa", str(ipa)])
-    completed = run(cmd, timeout=180, check=False)
+    with Spinner("Checking the FairPlay model..."):
+        completed = run(cmd, timeout=180, check=False)
     return parse_json((completed.stdout or "") + "\n" + (completed.stderr or ""))
 
 
@@ -2009,8 +2452,8 @@ def ensure_model(
     if current and current.get("decrypt_ready"):
         return current
 
-    log("no matching FairPlay model; recovering the enrollment model", tag="unfairplay")
-    log("macOS will ask for your login password once", tag="unfairplay")
+    stage("Recovering the FairPlay model...")
+    detail("macOS will ask for your login password once.")
     cleanup: Optional[Path] = None
     if app_path is None:
         app_path, cleanup = extract_app(ipa)
@@ -2038,11 +2481,12 @@ def ensure_model(
             % tail((completed.stderr or "") + "\n" + (completed.stdout or ""))
         )
     if parsed.get("plaintext_verified") is False:
-        log(
-            "warning: plaintext_verified=false; the model was saved but this "
-            "IPA has no pre-encryption hash table"
+        warn(
+            "plaintext_verified=false; the model was saved but this IPA has "
+            "no pre-encryption hash table"
         )
-    log("model saved: %s" % parsed.get("model", MODEL_DIR), tag="unfairplay")
+    success("FairPlay model saved")
+    detail(str(parsed.get("model", MODEL_DIR)))
 
     final = doctor(ipa)
     if not final or not final.get("decrypt_ready"):
@@ -2064,7 +2508,7 @@ def reveal_path(path: Path) -> None:
         else:
             subprocess.run(["xdg-open", str(path.parent)], check=False)
     except (FileNotFoundError, OSError):
-        log("warning: could not reveal %s" % path)
+        warn("could not reveal %s" % path)
 
 
 def default_output(info: Dict[str, Any]) -> Path:
@@ -2126,7 +2570,7 @@ def run_exec_hook(
     cmd = format_template(cmd_template, info, external_id).replace(
         "{}", str(target_path)
     )
-    log("running hook: %s" % cmd)
+    detail("Running hook: %s" % cmd)
     vlog("+ " + cmd)
     options: Dict[str, Any] = {}
     if JSON_OUTPUT:
@@ -2223,9 +2667,10 @@ def decrypt_ipa(
     if force:
         cmd.append("--force")
 
-    log("decrypting %s" % ipa.name, tag="unfairplay")
+    stage("Decrypting & verifying...")
     try:
-        completed = run(cmd, timeout=1800, check=False)
+        with Spinner("Decrypting..."):
+            completed = run(cmd, timeout=1800, check=False)
         parsed = parse_json(
             (completed.stdout or "") + "\n" + (completed.stderr or "")
         )
@@ -2242,7 +2687,7 @@ def decrypt_ipa(
         if full_output:
             report.chmod(0o600)
         if not parsed.get("PlaintextVerified"):
-            log("warning: plaintext verification was false for this IPA", tag="unfairplay")
+            warn("plaintext verification was false for this IPA")
 
         if not keep_account_data:
             if parsed.get("AccountDataStripped") is not True:
@@ -2279,12 +2724,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         )
     ensure_ipatool(update=args.update)
     info = ensure_auth(force=args.reauth)
-    log("account: %s" % (info.get("email") or info.get("name") or "unknown"))
+    detail("Account: %s" % (info.get("email") or info.get("name") or "unknown"))
     decrypt_supported = _decrypt_supported()
 
     if args.seed:
         ensure_unfairplay(update=args.update)
-        log("warming the FairPlay model with %r" % args.seed)
+        stage("Warming the FairPlay model with %r..." % args.seed)
         app = resolve_app(args.seed, args.platform)
         external_id = ""
         if args.version:
@@ -2308,7 +2753,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 shutil.rmtree(app_root, ignore_errors=True)
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        log("FairPlay model is ready")
+        success("FairPlay model is ready")
     elif decrypt_supported:
         ensure_unfairplay(update=args.update)
         state = doctor()
@@ -2316,26 +2761,25 @@ def cmd_setup(args: argparse.Namespace) -> int:
             state.get("decrypt_ready")
             or (state.get("checks") or {}).get("model_valid")
         ):
-            log("FairPlay model is ready")
+            success("FairPlay model is ready")
         else:
-            log(
-                "no FairPlay model yet; it will be created automatically on "
-                "the first `ipa-dlp get`, with one admin prompt"
+            warn(
+                "No FairPlay model yet; it will be created automatically on "
+                "the first `ipa-dlp get`, with one admin prompt."
             )
     else:
-        log(
+        warn(
             "FairPlay decryption is unavailable on this platform; "
-            "`ipa-dlp get --encrypted` still downloads raw IPAs"
+            "`ipa-dlp get --encrypted` still downloads raw IPAs."
         )
 
-    log("")
-    log("Installed and authenticated. Try:")
+    success("Installed and authenticated.")
     if decrypt_supported:
-        log("  ipa-dlp get spotify")
-        log("  ipa-dlp get spotify --version 9.1.88")
+        detail("Try: ipa-dlp get spotify")
+        detail("     ipa-dlp get spotify --version 9.1.88")
     else:
-        log("  ipa-dlp get spotify --encrypted")
-        log("  ipa-dlp get spotify -F")
+        detail("Try: ipa-dlp get spotify --encrypted")
+        detail("     ipa-dlp get spotify -F")
     if JSON_OUTPUT:
         _emit_json(
             {
@@ -2368,6 +2812,12 @@ def _info_summary(info: Dict[str, Any]) -> Dict[str, str]:
         "version": str(info.get("version", "")),
         "build": str(info.get("build", "")),
     }
+
+
+def _app_version_label(info: Dict[str, Any]) -> str:
+    name = str(info.get("name") or "App").strip()
+    version = str(info.get("version") or "").strip()
+    return ("%s %s" % (name, version)).strip()
 
 
 def _emit_json(value: Dict[str, Any]) -> None:
@@ -2419,10 +2869,11 @@ def _get_result(
     ensure_ipatool()
     ensure_auth()
 
+    stage("Resolving %s..." % query)
     app = resolve_app(query, platform_name)
     app_id = str(app.get("id", ""))
-    log(
-        "app: %s [%s] id=%s"
+    detail(
+        "%s [%s] id=%s"
         % (app.get("name", "?"), app.get("bundleID", "?"), app_id)
     )
 
@@ -2440,13 +2891,13 @@ def _get_result(
     metadata: Dict[str, Any] = {}
     if version and not external_id:
         external_id, metadata = resolve_version(app_id, version)
-        log(
-            "version: %s (external id %s)"
+        detail(
+            "Version %s (external id %s)"
             % (metadata.get("displayVersion", version), external_id)
         )
 
     if dry_run:
-        log("dry run: would download and decrypt this app")
+        detail("Dry run: would download and decrypt this app.")
         return {
             "ok": True,
             "command": "get",
@@ -2467,10 +2918,15 @@ def _get_result(
         ipa = work / "App.ipa"
         purchase = purchase or app_is_free(app)
         confirm_purchase(app, purchase)
-        if purchase:
-            log("obtaining a free App Store license if needed", tag="ipatool")
+        requested = version or str(metadata.get("displayVersion") or "")
+        stage(
+            "Downloading %s%s..."
+            % (
+                app.get("name", "App"),
+                (" " + requested) if requested else "",
+            )
+        )
         info = download_ipa(app, external_id, platform_name, ipa, purchase)
-        log("downloaded: %s %s" % (info.get("name"), info.get("version")), tag="download")
         if version and info.get("version") != version:
             raise CliError(
                 "downloaded version %s does not match requested %s"
@@ -2492,9 +2948,7 @@ def _get_result(
                 destination.unlink()
             shutil.move(str(ipa), str(destination))
             destination.chmod(0o600)
-            log("encrypted IPA: %s" % destination)
-            log("not decrypted (--encrypted)")
-            log("done.")
+            success("%s (encrypted IPA)" % _app_version_label(info))
             if exec_hook:
                 run_exec_hook(exec_hook, destination, info, external_id)
             if reveal:
@@ -2562,18 +3016,22 @@ def _get_result(
         "verified": bool(report.get("PlaintextVerified")),
         "account_data_stripped": not keep_account_data,
     }
-    log("decrypted IPA: %s" % destination)
+    verified = bool(report.get("PlaintextVerified"))
+    success(
+        "%s (%s, %s)"
+        % (
+            _app_version_label(info),
+            "verified" if verified else "not verified",
+            "account data stripped"
+            if not keep_account_data
+            else "account data kept",
+        )
+    )
     if binary_dest is not None:
-        log("binary: %s" % binary_dest)
-    log("verified: %s" % ("yes" if report.get("PlaintextVerified") else "no"))
-    if keep_account_data:
-        log("account data stripped: no (kept by request)")
-    else:
-        log("account data stripped: yes")
+        detail("Binary: %s" % binary_dest)
     if full_output:
-        log("encrypted IPA: %s" % encrypted_path(destination))
-        log("report: %s" % report_path(destination))
-    log("done.")
+        detail("Encrypted IPA: %s" % encrypted_path(destination))
+        detail("Report: %s" % report_path(destination))
     if exec_hook:
         run_exec_hook(exec_hook, artifact, info, external_id)
     if reveal:
@@ -2668,17 +3126,21 @@ def _decrypt_result(
         "verified": bool(report.get("PlaintextVerified")),
         "account_data_stripped": not keep_account_data,
     }
-    log("decrypted IPA: %s" % destination)
+    verified = bool(report.get("PlaintextVerified"))
+    success(
+        "%s (%s, %s)"
+        % (
+            _app_version_label(info),
+            "verified" if verified else "not verified",
+            "account data stripped"
+            if not keep_account_data
+            else "account data kept",
+        )
+    )
     if binary_dest is not None:
-        log("binary: %s" % binary_dest)
-    log("verified: %s" % ("yes" if report.get("PlaintextVerified") else "no"))
-    if keep_account_data:
-        log("account data stripped: no (kept by request)")
-    else:
-        log("account data stripped: yes")
+        detail("Binary: %s" % binary_dest)
     if full_output:
-        log("report: %s" % report_path(destination))
-    log("done.")
+        detail("Report: %s" % report_path(destination))
     if exec_hook:
         run_exec_hook(exec_hook, artifact, info)
     if reveal:
@@ -2755,23 +3217,66 @@ def cmd_status(args: argparse.Namespace) -> int:
     if JSON_OUTPUT:
         _emit_json(payload)
         return 0
-    print("ipa-dlp %s" % VERSION)
-    print("ipatool:    %s (%s)" % (payload["ipatool"], payload["ipatool_version"]))
-    if unfairplay:
-        print("unfairplay: %s (%s)" % (unfairplay, unfairplay_version))
-    else:
-        print("unfairplay: unavailable (requires Apple Silicon Mac)")
-    print("account:    %s" % payload["account"])
-    print("models:     %s" % payload["models"])
-    if not decrypt_supported:
-        print("decrypt:    unavailable on this platform")
-    else:
+
+    out = sys.stdout
+    print(style("ipa-dlp %s" % VERSION, "1", "36", stream=out))
+
+    def line(label: str, value: str) -> None:
         print(
-            "decrypt:    %s"
-            % ("model ready" if model_ready else "setup on first get")
+            "%s %s"
+            % (style("%-11s" % (label + ":"), "1", stream=out), value)
         )
-    print("data:       %s" % payload["data"])
-    print("cache:      %s" % payload["cache"])
+
+    ipatool_version_text = style(
+        payload["ipatool_version"] or "unknown",
+        "32" if payload["ipatool_version"] else "33",
+        stream=out,
+    )
+    line(
+        "ipatool",
+        "%s (%s)" % (payload["ipatool"], ipatool_version_text),
+    )
+    if unfairplay:
+        version_text = style(
+            unfairplay_version or "unknown",
+            "32" if unfairplay_version else "33",
+            stream=out,
+        )
+        line("unfairplay", "%s (%s)" % (unfairplay, version_text))
+    else:
+        line(
+            "unfairplay",
+            style(
+                "unavailable (requires Apple Silicon Mac)",
+                "33",
+                stream=out,
+            ),
+        )
+    line(
+        "account",
+        style(
+            payload["account"],
+            "32" if info else "33",
+            stream=out,
+        ),
+    )
+    line("models", style(payload["models"], "2", stream=out))
+    if not decrypt_supported:
+        line(
+            "decrypt",
+            style("unavailable on this platform", "33", stream=out),
+        )
+    else:
+        line(
+            "decrypt",
+            style(
+                "model ready" if model_ready else "setup on first get",
+                "32" if model_ready else "33",
+                stream=out,
+            ),
+        )
+    line("data", style(payload["data"], "2", stream=out))
+    line("cache", style(payload["cache"], "2", stream=out))
     return 0
 
 
@@ -2939,11 +3444,13 @@ def _extract_local(
     )
     if dest.exists() and not force:
         raise CliError("output already exists (use --force): %s" % dest)
+    stage("Extracting arm64 slice...")
     data, encrypted, decrypted, info = _target_macho_bytes(target, info)
     if encrypted and not decrypted:
-        log("warning: the extracted image is still FairPlay-encrypted")
+        warn("the extracted image is still FairPlay-encrypted")
     _write_binary(data, dest)
-    log("extracted arm64 slice: %s" % dest)
+    success("Extracted arm64 slice")
+    detail(str(dest))
     if exec_hook:
         run_exec_hook(exec_hook, dest, info)
     return {
@@ -2981,7 +3488,7 @@ def load_macho(
     if target.exists():
         data, encrypted, decrypted, _ = _target_macho_bytes(target)
         if encrypted and not decrypted:
-            log("warning: the Mach-O image is still FairPlay-encrypted")
+            warn("the Mach-O image is still FairPlay-encrypted")
         return data
     with tempfile.TemporaryDirectory(prefix="ipa-dlp-macho-") as work:
         ipa = download(
@@ -2996,6 +3503,233 @@ def load_macho(
 # ---------------------------------------------------------------------------
 # entrypoint
 # ---------------------------------------------------------------------------
+
+
+_HELP_HEADINGS = {
+    "usage": "Usage",
+    "positional arguments": "Arguments",
+    "commands": "Commands",
+    "options": "Options",
+    "examples": "Examples",
+    "python api": "Python API",
+}
+_HELP_HEADING_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 _-]*):\s*$")
+_HELP_FLAG_RE = re.compile(r"(?<!\w)--?[A-Za-z][\w-]*")
+_HELP_UPPER_RE = re.compile(r"(?<![-A-Z0-9_])[A-Z][A-Z0-9_]*\b")
+
+
+def _help_style(text: str, *codes: Any) -> str:
+    """Style help output against stdout, which is where help is written."""
+    return style(text, *codes, stream=sys.stdout)
+
+
+def _style_help_invocation(text: str, section: str) -> str:
+    if section == "Commands":
+        return _help_style(text, "1", "36")
+    if section == "Arguments":
+        return _help_style(text, "2")
+    parts = re.split(r"(\s+)", text)
+    styled: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if part.isspace():
+            styled.append(part)
+        elif part.startswith("-"):
+            styled.append(_help_style(part, "32"))
+        elif re.fullmatch(r"[A-Z][A-Z0-9_]*", part):
+            styled.append(_help_style(part, "2"))
+        else:
+            styled.append(part)
+    return "".join(styled)
+
+
+def _style_help_tokens(text: str) -> str:
+    """Color flags and placeholders inside a usage or example fragment."""
+    text = _HELP_FLAG_RE.sub(
+        lambda match: _help_style(match.group(0), "32"), text
+    )
+    text = re.sub(
+        r"\{[^}]*\}", lambda match: _help_style(match.group(0), "36"), text
+    )
+    text = _HELP_UPPER_RE.sub(
+        lambda match: _help_style(match.group(0), "2"), text
+    )
+    return text
+
+
+def _style_help_example(line: str) -> str:
+    match = re.match(r"^(\s*)(ipa-dlp)(.*)$", line)
+    if not match:
+        return line
+    prefix, program, rest = match.groups()
+    command = re.match(r"^(\s+)([a-z][\w-]*)(?=\s|$)", rest)
+    if command:
+        rest = (
+            rest[: command.start(2)]
+            + _help_style(command.group(2), "1", "36")
+            + rest[command.end(2) :]
+        )
+    return prefix + _help_style(program, "1", "36") + _style_help_tokens(rest)
+
+
+class ColorHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Help formatter that colors sections, commands, flags, and metavars."""
+
+    def _format_action(self, action: argparse.Action) -> str:
+        # The pseudo-action that owns subcommands prints a bare ``COMMAND``
+        # line. Keep only its indented subcommand list.
+        if isinstance(action, argparse._SubParsersAction):
+            return "".join(
+                self._format_action(subaction)
+                for subaction in self._iter_indented_subactions(action)
+            )
+        return super()._format_action(action)
+
+    def format_help(self) -> str:
+        text = super().format_help()
+        output: List[str] = []
+        section = ""
+        in_usage = True
+        for line in text.splitlines():
+            if in_usage:
+                if not line.strip():
+                    in_usage = False
+                    output.append(line)
+                elif line.startswith("usage:"):
+                    output.append(
+                        _help_style("Usage:", "1", "33")
+                        + _style_help_tokens(line[len("usage:") :])
+                    )
+                else:
+                    output.append(_style_help_tokens(line))
+                continue
+
+            heading = _HELP_HEADING_RE.match(line)
+            if heading:
+                title = heading.group(1)
+                canonical = _HELP_HEADINGS.get(title.lower(), title)
+                section = canonical
+                output.append(_help_style(canonical + ":", "1", "33"))
+                continue
+
+            indent = len(line) - len(line.lstrip(" "))
+            if (
+                section in ("Commands", "Options", "Arguments")
+                and line.strip()
+                and indent <= 4
+            ):
+                body = line[indent:]
+                match = re.match(r"(\S.*?)(\s{2,})(\S.*)$", body)
+                if match:
+                    invocation, gap, help_text = match.groups()
+                    output.append(
+                        " " * indent
+                        + _style_help_invocation(invocation, section)
+                        + gap
+                        + help_text
+                    )
+                else:
+                    output.append(
+                        " " * indent
+                        + _style_help_invocation(body, section)
+                    )
+                continue
+
+            if section == "Examples" and line.startswith("  ipa-dlp "):
+                output.append(_style_help_example(line))
+                continue
+
+            output.append(line)
+
+        result = "\n".join(output)
+        if text.endswith("\n"):
+            result += "\n"
+        return result
+
+
+def _json_requested(raw: Sequence[str]) -> bool:
+    """Detect --json (including argparse abbreviations) before parsing."""
+    for item in raw:
+        if item == "--":
+            break
+        if not item.startswith("--") or len(item) <= 2:
+            continue
+        base = item.split("=", 1)[0]
+        if "--json".startswith(base):
+            return True
+    return False
+
+
+class ColorArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser with colored errors and app-query hints."""
+
+    command_names = ("setup", "get", "decrypt", "extract", "status", "help")
+    json_requested = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("formatter_class", ColorHelpFormatter)
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> None:
+        error(message)
+        match = re.search(
+            r"invalid choice: ['\"]([^'\"]+)['\"]", message
+        )
+        if match:
+            word = match.group(1)
+            close = difflib.get_close_matches(
+                word, self.command_names, n=1, cutoff=0.6
+            )
+            if close:
+                suggestion = "ipa-dlp %s" % close[0]
+                if close[0] in ("get", "decrypt", "extract"):
+                    raw = list(getattr(self, "_raw_args", []))
+                    try:
+                        index = raw.index(word)
+                    except ValueError:
+                        index = -1
+                    value_flags = {
+                        "-v",
+                        "--version",
+                        "-o",
+                        "--output",
+                        "--external-version-id",
+                        "--limit",
+                        "--exec",
+                        "--platform",
+                        "--seed",
+                    }
+                    trailing: List[str] = []
+                    skip_value = False
+                    for item in raw[index + 1 :]:
+                        if skip_value:
+                            skip_value = False
+                            continue
+                        if item.startswith("-"):
+                            skip_value = item in value_flags
+                            continue
+                        trailing.append(item)
+                    if trailing:
+                        suggestion += " " + trailing[0]
+                eprint(style("Did you mean: %s?" % suggestion, "1"))
+            elif word and not word.startswith("-"):
+                eprint(
+                    style(
+                        "Hint: To download an app, run: ipa-dlp get %s"
+                        % word,
+                        "2",
+                    )
+                )
+        eprint(style("Run 'ipa-dlp --help' for usage.", "2"))
+        if ColorArgumentParser.json_requested:
+            _emit_json({"ok": False, "error": message})
+        self.exit(2)
+
+
+def _configure_subparser(parser: argparse.ArgumentParser) -> None:
+    parser._positionals.title = "Arguments"
+    parser._optionals.title = "Options"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3022,35 +3756,50 @@ def build_parser() -> argparse.ArgumentParser:
         help="emit one structured JSON object on stdout",
     )
 
-    parser = argparse.ArgumentParser(
+    parser = ColorArgumentParser(
         prog=APP,
         description="Fetch, decrypt, and extract App Store IPAs and Mach-O binaries.",
         parents=[common],
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=ColorHelpFormatter,
         epilog=(
-            "examples:\n"
+            "Examples:\n"
             "  ipa-dlp get spotify --version 9.1.88\n"
             "  ipa-dlp get spotify -v 9.1.88 --extract-binary\n"
             "  ipa-dlp get spotify -F --limit 15\n"
             "  ipa-dlp get spotify --encrypted\n"
             "  ipa-dlp extract ./Spotify.ipa -o Spotify.bin\n"
             "  ipa-dlp get spotify -v 9.1.88 --json\n\n"
-            "python api:\n"
+            "Python API:\n"
             "  from ipa_dlp import load_macho, download, extract_binary\n"
             "  blob = load_macho('spotify', version='9.1.88')  # arm64 Mach-O bytes\n"
         ),
     )
-    parser.add_argument("--version", action="version", version="%s %s" % (APP, VERSION))
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser._optionals.title = "Options"
+    parser.add_argument(
+        "--version", action="version", version="%s %s" % (APP, VERSION)
+    )
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=False,
+        title="Commands",
+        metavar="COMMAND",
+    )
 
     setup = subparsers.add_parser(
         "setup",
         help="install tools and sign in to the App Store",
         parents=[common],
     )
-    setup.add_argument("--update", action="store_true", help="reinstall pinned tools")
-    setup.add_argument("--reauth", action="store_true", help="force a new login")
-    setup.add_argument("--seed", help="optional app to warm the FairPlay model now")
+    _configure_subparser(setup)
+    setup.add_argument(
+        "--update", action="store_true", help="reinstall pinned tools"
+    )
+    setup.add_argument(
+        "--reauth", action="store_true", help="force a new login"
+    )
+    setup.add_argument(
+        "--seed", help="optional app to warm the FairPlay model now"
+    )
     setup.add_argument(
         "-v", "--version", dest="version", help="version for --seed"
     )
@@ -3065,10 +3814,14 @@ def build_parser() -> argparse.ArgumentParser:
     get = subparsers.add_parser(
         "get", help="download and decrypt an app", parents=[common]
     )
+    _configure_subparser(get)
     get.add_argument("query", help="app name, bundle ID, or App Store ID")
     get.add_argument("pos_version", nargs="?", help=argparse.SUPPRESS)
     get.add_argument("-v", "--version", help="exact app version, e.g. 9.1.88")
-    get.add_argument("--external-version-id", help="skip version lookup with an App Store external version ID")
+    get.add_argument(
+        "--external-version-id",
+        help="skip version lookup with an App Store external version ID",
+    )
     get.add_argument("-o", "--output", help="output IPA path")
     get.add_argument(
         "-F",
@@ -3127,6 +3880,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="decrypt an IPA already downloaded to this Mac",
         parents=[common],
     )
+    _configure_subparser(decrypt)
     decrypt.add_argument("ipa")
     decrypt.add_argument("-o", "--output")
     decrypt.add_argument(
@@ -3160,7 +3914,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="extract the arm64 Mach-O slice from an IPA, .app, or binary",
         parents=[common],
     )
-    extract.add_argument("target", help="path to an .ipa, .app, or Mach-O file")
+    _configure_subparser(extract)
+    extract.add_argument(
+        "target", help="path to an .ipa, .app, or Mach-O file"
+    )
     extract.add_argument(
         "-o",
         "--output",
@@ -3179,50 +3936,125 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser(
         "status", help="show tools, account, and model state", parents=[common]
     )
+    _configure_subparser(status)
     status.set_defaults(func=cmd_status)
 
+    help_parser = subparsers.add_parser(
+        "help",
+        help="show help for ipa-dlp or one command",
+        parents=[common],
+    )
+    _configure_subparser(help_parser)
+    help_parser.add_argument(
+        "topic",
+        nargs="?",
+        metavar="COMMAND",
+        help="command to describe (for example: get)",
+    )
+    help_parser.set_defaults(func=None)
+
+    parser._subcommand_parsers = dict(subparsers.choices)
     return parser
+
+
+def _show_help(
+    parser: argparse.ArgumentParser, topic: Optional[str]
+) -> int:
+    subcommands = getattr(parser, "_subcommand_parsers", {})
+    if not topic:
+        parser.print_help()
+        return 0
+    name = topic.strip()
+    target = subcommands.get(name)
+    if target is None:
+        close = difflib.get_close_matches(
+            name, list(subcommands), n=1, cutoff=0.6
+        )
+        if close:
+            raise CliError(
+                "unknown help topic %r; did you mean %r?" % (name, close[0])
+            )
+        raise CliError(
+            "unknown help topic %r (available: %s)"
+            % (name, ", ".join(sorted(subcommands)))
+        )
+    target.print_help()
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global USE_GUI, VERBOSE, JSON_OUTPUT
+    USE_GUI = False
+    VERBOSE = False
+    JSON_OUTPUT = False
     if sys.version_info < (3, 9):
-        eprint("error: Python 3.9 or newer is required")
+        error("Python 3.9 or newer is required")
         return 1
     parser = build_parser()
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+    parser._raw_args = raw_args
+    json_requested = _json_requested(raw_args)
+    ColorArgumentParser.json_requested = json_requested
+    JSON_OUTPUT = json_requested
     args = parser.parse_args(argv)
     USE_GUI = bool(getattr(args, "gui", False))
     VERBOSE = bool(getattr(args, "verbose", False))
     JSON_OUTPUT = bool(getattr(args, "json", False))
+    command = getattr(args, "command", None)
+
+    if command is None:
+        if JSON_OUTPUT:
+            _emit_json(
+                {
+                    "ok": False,
+                    "error": "no command; run 'ipa-dlp help' for usage",
+                }
+            )
+            return 2
+        parser.print_help()
+        return 0
+
+    if command == "help":
+        try:
+            return _show_help(parser, getattr(args, "topic", None))
+        except CliError as exc:
+            error(str(exc))
+            if JSON_OUTPUT:
+                _emit_json({"ok": False, "error": str(exc)})
+            return 1
+
     if getattr(os, "geteuid", lambda: 1)() == 0:
         message = (
             "run ipa-dlp as your normal user; it asks for admin only when needed"
         )
-        eprint("error: %s" % message)
+        error(message)
         if JSON_OUTPUT:
             _emit_json({"ok": False, "error": message})
         return 1
     ensure_private_dir(DATA_DIR)
     ensure_private_dir(CACHE_DIR)
     try:
-        return int(args.func(args))
+        func = getattr(args, "func", None)
+        if func is None:
+            raise CliError("no command")
+        return int(func(args))
     except Cancelled:
-        log("canceled")
+        warn("Canceled")
         if JSON_OUTPUT:
             _emit_json({"ok": False, "error": "canceled"})
         return 130
     except CliError as exc:
-        eprint("error: %s" % exc)
+        error(str(exc))
         if JSON_OUTPUT:
             _emit_json({"ok": False, "error": str(exc)})
         return 1
     except EOFError:
-        log("canceled (no input)")
+        warn("Canceled (no input)")
         if JSON_OUTPUT:
             _emit_json({"ok": False, "error": "canceled (no input)"})
         return 130
     except KeyboardInterrupt:
-        log("interrupted")
+        warn("Interrupted")
         if JSON_OUTPUT:
             _emit_json({"ok": False, "error": "interrupted"})
         return 130
